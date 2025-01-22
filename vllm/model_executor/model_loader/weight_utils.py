@@ -17,6 +17,7 @@ import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
+from zipnn import decompress_safetensors_tensor, get_compressed_tensors_metadata
 
 from vllm.config import LoadConfig, ModelConfig
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -402,6 +403,27 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def znn_safetensors_weights_iterator(
+    f: safe_open
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model znn safetensor files."""
+    import time
+    total_time = 0
+    total_bytes = 0
+    compressed_tensors_metadata = get_compressed_tensors_metadata(f.metadata())
+    for name in f.keys():  # noqa: SIM118
+        param = f.get_tensor(name)
+        t = time.time()
+        if name in compressed_tensors_metadata:
+            param = decompress_safetensors_tensor(param)
+        total_time += time.time() - t
+        total_bytes += param.nelement() * param.element_size()
+        yield name, param
+
+    logger.info("Model decompression took %.6f secs, at %.2f GB/s",
+                total_time, (total_bytes / total_time) / (1 << 30))
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -415,6 +437,10 @@ def safetensors_weights_iterator(
             bar_format=_BAR_FORMAT,
     ):
         with safe_open(st_file, framework="pt") as f:
+            if st_file.endswith(".znn.safetensors"):
+                for name, param in znn_safetensors_weights_iterator(f):
+                    yield name, param
+                return
             for name in f.keys():  # noqa: SIM118
                 param = f.get_tensor(name)
                 yield name, param
