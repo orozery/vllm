@@ -55,7 +55,6 @@ run_tests_for_model() {
 
   # Get model-specific arguments
   local model_args=$(get_model_args "$model_name")
-  set_cli_args "$@"
 
   # Arrays to store all hosts and ports
   PREFILL_HOSTS=()
@@ -77,7 +76,7 @@ run_tests_for_model() {
     echo "Starting prefill instance $i on GPU $GPU_ID, port $PORT"
 
     # Build the command with or without model-specific args
-    BASE_CMD="VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_ENABLE_V1_MULTIPROCESSING=0 CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_NIXL_SIDE_CHANNEL_PORT=$SIDE_CHANNEL_PORT vllm serve $model_name \
+    BASE_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_NIXL_SIDE_CHANNEL_PORT=$SIDE_CHANNEL_PORT vllm serve $model_name \
     --port $PORT \
     --enforce-eager \
     --disable-log-requests \
@@ -91,7 +90,7 @@ run_tests_for_model() {
     FULL_CMD="$BASE_CMD"
     fi
 
-    eval "$FULL_CMD 2>&1 > out_prefiller &"
+    eval "$FULL_CMD 2>&1 &"
 
     # Store host and port for proxy configuration
     PREFILL_HOSTS+=("localhost")
@@ -111,7 +110,7 @@ run_tests_for_model() {
     echo "Starting decode instance $i on GPU $GPU_ID, port $PORT"
 
     # Build the command with or without model-specific args
-    BASE_CMD="VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_ENABLE_V1_MULTIPROCESSING=0 CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_NIXL_SIDE_CHANNEL_PORT=$SIDE_CHANNEL_PORT vllm serve $model_name \
+    BASE_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_NIXL_SIDE_CHANNEL_PORT=$SIDE_CHANNEL_PORT vllm serve $model_name \
     --port $PORT \
     --enforce-eager \
     --disable-log-requests \
@@ -125,7 +124,7 @@ run_tests_for_model() {
     FULL_CMD="$BASE_CMD"
     fi
 
-    eval "$FULL_CMD 2>&1 > out_decoder &"
+    eval "$FULL_CMD &"
 
     # Store host and port for proxy configuration
     DECODE_HOSTS+=("localhost")
@@ -172,7 +171,7 @@ run_tests_for_model() {
 
 # Run tests for each model
 for model in "${MODELS[@]}"; do
-  run_tests_for_model "$model" "$@"
+  run_tests_for_model "$model"
 done
 
 echo "All tests completed!"
