@@ -90,7 +90,7 @@ run_tests_for_model() {
     FULL_CMD="$BASE_CMD"
     fi
 
-    eval "$FULL_CMD 2>&1 &"
+    eval "$FULL_CMD &"
 
     # Store host and port for proxy configuration
     PREFILL_HOSTS+=("localhost")
