@@ -222,10 +222,15 @@ class EngineCore:
                 outputs=[],
                 scheduler_stats=self.scheduler.make_stats(),
             )
+
         scheduler_output = self.scheduler.schedule()
+        t1 = time.perf_counter()
         model_output = self.execute_model(scheduler_output)
+        t2 = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+
+        logger.debug("EngineCore.step %d %.4f", scheduler_output.total_num_scheduled_tokens, t2-t1)
 
         return engine_core_outputs
 
