@@ -20,6 +20,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.request import StructuredOutputRequest
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler
+from ..worker.test_gpu_model_runner import BLOCK_SIZE
 
 
 def test_add_requests():
@@ -760,7 +761,7 @@ def _assert_right_scheduler_output(
 
 def _assert_right_kv_cache_manager(
     scheduler: Scheduler,
-    req_ids: list[str],
+    requests: list[Request],
     num_tokens: int,
     block_size: int,
     num_requests: int,
@@ -770,12 +771,12 @@ def _assert_right_kv_cache_manager(
 
     # Make sure the request stats are right.
     EXPECTED_TOTAL_BLOCKS = num_tokens // block_size
-    for req_id in req_ids:
+    for req in requests:
         blocks = (scheduler.kv_cache_manager.coordinator.
-                  single_type_managers[0].req_to_blocks[req_id])
-        hashes = scheduler.kv_cache_manager.req_to_block_hashes[req_id]
+                  single_type_managers[0].req_to_blocks[req.request_id])
+        hashes = req.block_hashes
         assert (scheduler.kv_cache_manager.coordinator.single_type_managers[0].
-                num_cached_block[req_id] == EXPECTED_TOTAL_BLOCKS)
+                num_cached_block[req.request_id] == EXPECTED_TOTAL_BLOCKS)
         assert len(blocks) == EXPECTED_TOTAL_BLOCKS
         assert len(hashes) == EXPECTED_TOTAL_BLOCKS
 
@@ -838,7 +839,8 @@ def test_kv_connector_basic():
     MAX_TOKENS = 3
     requests = create_requests(num_requests=NUM_REQUESTS,
                                num_tokens=NUM_TOKENS,
-                               max_tokens=MAX_TOKENS)
+                               max_tokens=MAX_TOKENS,
+                               block_size=BLOCK_SIZE)
     req_ids = []
     req_to_index = {}
     for i, request in enumerate(requests):
@@ -866,7 +868,7 @@ def test_kv_connector_basic():
     )
 
     # Ensure KVCacheManager is correct.
-    _assert_right_kv_cache_manager(scheduler, req_ids, NUM_TOKENS, BLOCK_SIZE,
+    _assert_right_kv_cache_manager(scheduler, requests, NUM_TOKENS, BLOCK_SIZE,
                                    NUM_REQUESTS, NUM_TOTAL_BLOCKS)
 
     # Continue Generation until done.
@@ -884,7 +886,8 @@ def test_kv_connector_basic():
     NUM_TOKENS = NUM_TOKENS_PREFIX * 2
     requests = create_requests(num_requests=NUM_REQUESTS,
                                num_tokens=NUM_TOKENS,
-                               max_tokens=MAX_TOKENS)
+                               max_tokens=MAX_TOKENS,
+                               block_size=BLOCK_SIZE)
     req_ids = []
     req_to_index = {}
     for i, request in enumerate(requests):
@@ -913,7 +916,7 @@ def test_kv_connector_basic():
                                        NUM_MATCHED_NEW_TOKENS))
 
     # Ensure KVCacheManager is correct.
-    _assert_right_kv_cache_manager(scheduler, req_ids, NUM_TOKENS, BLOCK_SIZE,
+    _assert_right_kv_cache_manager(scheduler, requests, NUM_TOKENS, BLOCK_SIZE,
                                    NUM_REQUESTS, NUM_TOTAL_BLOCKS)
 
     # Continue Generation until done.
@@ -951,7 +954,8 @@ def test_kv_connector_unable_to_allocate():
     MAX_TOKENS = 2
     requests = create_requests(num_requests=NUM_REQUESTS,
                                num_tokens=NUM_TOKENS,
-                               max_tokens=MAX_TOKENS)
+                               max_tokens=MAX_TOKENS,
+                               block_size=BLOCK_SIZE)
     req_ids = []
     req_to_index = {}
     for i, request in enumerate(requests):
@@ -1032,7 +1036,8 @@ def test_kv_connector_handles_preemption():
     MAX_TOKENS = BLOCK_SIZE * 2
     requests = create_requests(num_requests=NUM_REQUESTS,
                                num_tokens=NUM_TOKENS,
-                               max_tokens=MAX_TOKENS)
+                               max_tokens=MAX_TOKENS,
+                               block_size=BLOCK_SIZE)
     req_ids = []
     req_to_index = {}
     for i, request in enumerate(requests):
@@ -1160,7 +1165,6 @@ def assert_scheduler_empty(scheduler: Scheduler):
     # KVCache Manager.
     assert len(scheduler.kv_cache_manager.coordinator.single_type_managers[0].
                req_to_blocks) == 0
-    assert len(scheduler.kv_cache_manager.req_to_block_hashes) == 0
     assert len(scheduler.kv_cache_manager.coordinator.single_type_managers[0].
                num_cached_block) == 0
     num_free_blocks = (
@@ -1188,7 +1192,8 @@ def test_memory_leak():
     MAX_TOKENS = 10
     requests = create_requests(num_requests=NUM_REQUESTS,
                                num_tokens=NUM_TOKENS,
-                               max_tokens=MAX_TOKENS)
+                               max_tokens=MAX_TOKENS,
+                               block_size=BLOCK_SIZE)
 
     # Add each request.
     for request in requests:
