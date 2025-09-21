@@ -253,11 +253,13 @@ class OffloadingConnectorScheduler:
 
             if preempted:
                 self._request_block_ids[req_id] = []
+                logger.info(f"Request {req_id} preempted")
 
             if new_block_id_groups:
                 assert len(new_block_id_groups) == 1
                 new_block_ids = new_block_id_groups[0]
                 self._request_block_ids[req_id] += new_block_ids
+                logger.info(f"Request {req_id} with {len(new_block_ids)} new blocks. Total: {len(self._request_block_ids[req_id])}")
 
             block_ids = self._request_block_ids[req_id]
 
@@ -292,6 +294,8 @@ class OffloadingConnectorScheduler:
                 continue
 
             self.manager.touch(block_hashes)
+
+            logger.info(f"Request {req_id} preparing to store from block {start_block_idx} to {num_blocks} and there are {len(block_ids)} gpu blocks")
 
             dst_specs = store_output.store_specs
             src_specs: list[LoadStoreSpec] = []
