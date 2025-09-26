@@ -240,6 +240,8 @@ class OffloadingConnectorScheduler:
         self._reqs_being_loaded[request.request_id] |= set(block_hashes)
 
     def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
+        logger.info(f"scheduler_output {scheduler_output}")
+
         reqs_to_store: dict[ReqId, TransferSpec] = {}
         # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in itertools.chain(
