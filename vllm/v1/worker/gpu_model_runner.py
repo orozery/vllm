@@ -4086,6 +4086,79 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 ),
             )
 
+    def _allocate_uniform_kv_caches(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor]:
+        """
+        Initializes and reshapes KV caches for the simple case of a single
+        attention group and backend.
+
+        Args:
+            kv_cache_config: The KV cache config
+        Returns:
+            dict[str, torch.Tensor]: A map between layer names to their
+            corresponding memory buffer for KV cache.
+            An empty dictionary is returned if the given KV cache config
+            is incompatible with this simple type of layout.
+        """
+        if len(self.attn_groups) != 1 or len(self.attn_groups[0]) != 1:
+            return {}
+
+        attn_group = self.attn_groups[0][0]
+        kv_cache_spec = attn_group.kv_cache_spec
+        if not isinstance(kv_cache_spec, AttentionSpec):
+            return {}
+
+        attn_backend = attn_group.backend
+        test_shape = attn_backend.get_kv_cache_shape(
+            num_blocks=1234, block_size=16, num_kv_heads=8, head_size=256
+        )
+        if test_shape.count(1234) != 1:
+            return {}
+        num_blocks_dim = test_shape.index(1234)
+
+        tensor_sizes = set(kv_cache_tensor.size for kv_cache_tensor
+                           in kv_cache_config.kv_cache_tensors)
+        assert len(tensor_sizes) == 1
+        tensor_size = tensor_sizes.pop()
+
+        page_size = kv_cache_spec.page_size_bytes
+        assert tensor_size % page_size == 0
+        num_blocks = tensor_size // page_size
+        num_tensors = len(kv_cache_config.kv_cache_tensors)
+        total_size = tensor_size * num_tensors
+
+        kv_cache_shape = attn_backend.get_kv_cache_shape(
+            num_blocks,
+            kv_cache_spec.block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=self.cache_config.cache_dtype,
+        )
+
+        # insert (num_tensors) dimensions into the shape
+        num_layers_dim = num_blocks_dim + 1
+        kv_cache_shape = (kv_cache_shape[:num_layers_dim] + (num_tensors,) +
+                          kv_cache_shape[num_layers_dim:])
+
+        logger.info("Allocating a single KV cache buffer for all layers")
+
+        # allocate one contiguous buffer for all layers
+        buffer = (torch.zeros(total_size, dtype=torch.int8,
+                             device=self.device)
+                  .view(kv_cache_spec.dtype)
+                  .view(kv_cache_shape))
+
+        kv_caches = {}
+        for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            indices = [slice(None)] * buffer.ndim
+            indices[num_layers_dim] = i
+            tensor = buffer[tuple(indices)]
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_caches[layer_name] = tensor
+
+        return kv_caches
+
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -4152,8 +4225,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+                raw_tensor_size = raw_tensor.element_size() * raw_tensor.nelement()
+                assert raw_tensor_size % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor_size // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
@@ -4182,6 +4257,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+
                     kv_caches[layer_name] = (
                         kv_cache_raw_tensors[layer_name]
                         .view(dtype)
@@ -4259,8 +4335,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+
         # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        kv_cache_raw_tensors = self._allocate_uniform_kv_caches(
+            kv_cache_config)
+        if not kv_cache_raw_tensors:
+            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(
+                kv_cache_config)
+
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(
             kv_cache_config, kv_cache_raw_tensors
