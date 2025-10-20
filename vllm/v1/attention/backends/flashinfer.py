@@ -205,14 +205,20 @@ class FlashInferBackend(AttentionBackend):
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
-    def get_kv_cache_stride_order() -> tuple[int, ...]:
+    def get_kv_cache_stride_order(with_layers_dim: bool) -> tuple[int, ...]:
         # `stride_order` indicates the permutation that gets us from
         # `get_kv_cache_shape` to the actual memory layout we want.
         cache_layout = get_kv_cache_layout()
         if cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3, 4)
+            if with_layers_dim:
+                stride_order = (1, 2, 0, 3, 4, 5)
+            else:
+                stride_order = (0, 1, 2, 3, 4)
         elif cache_layout == "HND":
-            stride_order = (0, 1, 3, 2, 4)
+            if with_layers_dim:
+                stride_order = (1, 2, 4, 0, 3, 5)
+            else:
+                stride_order = (0, 1, 3, 2, 4)
         else:
             raise ValueError(f"Unknown cache layout format {cache_layout}.")
         return stride_order
@@ -921,7 +927,7 @@ class FlashInferImpl(AttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
-        stride_order = FlashInferBackend.get_kv_cache_stride_order()
+        stride_order = FlashInferBackend.get_kv_cache_stride_order(False)
         kv_cache_permute = kv_cache.permute(*stride_order)
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
