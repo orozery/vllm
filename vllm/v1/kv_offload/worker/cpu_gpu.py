@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import mycuda
 import numpy as np
 import torch
 
@@ -99,6 +99,8 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 num_blocks_idx = 1
                 self.kv_dim_before_num_blocks.append(True)
 
+            self.block_size_bytes = gpu_tensor.stride(num_blocks_idx) * gpu_tensor.element_size()
+
             cpu_shape = list(gpu_shape)
             cpu_shape[num_blocks_idx] = num_cpu_blocks * self.block_size_factor
 
@@ -112,13 +114,32 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 )
             )
 
+        gpu_pointers = torch.empty(
+            len(gpu_caches), dtype=torch.int64, device="cpu"
+        )
+        gpu_pointers.numpy()[:] = [t.data_ptr() for t in self.gpu_tensors]
+        self.gpu_tensor = torch.empty(
+            len(gpu_caches), dtype=torch.int64, device=self.gpu_tensors[0].device
+        )
+        self.gpu_tensor.copy_(gpu_pointers)
+
+        cpu_pointers = torch.zeros(
+            len(gpu_caches), dtype=torch.int64, device="cpu", pin_memory=pin_memory
+        )
+        cpu_pointers.numpy()[:] = [t.data_ptr() for t in self.cpu_tensors]
+        self.cpu_tensor = torch.empty(
+            len(gpu_caches), dtype=torch.int64, device=self.gpu_tensors[0].device
+        )
+        self.cpu_tensor.copy_(cpu_pointers)
+        self.total_layer_bytes = self.gpu_tensor[0].element_size() * self.gpu_tensor[0].numel()
+
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         src_spec, dst_spec = spec
         if isinstance(src_spec, CPULoadStoreSpec):
             assert isinstance(dst_spec, GPULoadStoreSpec)
             stream = self.h2d_stream
-            src_tensors = self.cpu_tensors
-            dst_tensors = self.gpu_tensors
+            src_tensor = self.cpu_tensor
+            dst_tensor = self.gpu_tensor
             src_block_size_factor = self.block_size_factor
             dst_block_size_factor = 1
         else:
@@ -155,18 +176,21 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
 
         event = self.events_pool.pop() if self.events_pool else torch.cuda.Event()
         with torch.cuda.stream(stream):
-            for src_tensor, dst_tensor, kv_dim in zip(
-                src_tensors, dst_tensors, self.kv_dim_before_num_blocks
-            ):
-                if kv_dim:
-                    src_key_cache = src_tensor[0]
-                    dst_key_cache = dst_tensor[0]
-                    ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
-                    src_value_cache = src_tensor[1]
-                    dst_value_cache = dst_tensor[1]
-                    ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
-                else:
-                    ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
+            if isinstance(src_spec, CPULoadStoreSpec):
+                mycuda.swap_blocks_multi_layer(src_tensor, dst_tensor, src_to_dst_tensor, self.block_size_bytes, self.total_layer_bytes)
+            else:
+                for src_tensor, dst_tensor, kv_dim in zip(
+                        src_tensors, dst_tensors, self.kv_dim_before_num_blocks
+                ):
+                    if kv_dim:
+                        src_key_cache = src_tensor[0]
+                        dst_key_cache = dst_tensor[0]
+                        ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
+                        src_value_cache = src_tensor[1]
+                        dst_value_cache = dst_tensor[1]
+                        ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
+                    else:
+                        ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
             event.record(stream)
 
         self.transfer_events[job_id] = event
