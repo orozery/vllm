@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
+import queue
+from collections import deque
 
+import mycuda
 import numpy as np
 import torch
 
@@ -68,8 +72,11 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         self.h2d_stream = torch.cuda.Stream()
 
         # job_id -> transfer cuda event
-        self.transfer_events: dict[int, torch.cuda.Event] = {}
+        self.transfer_events: dict[torch.cuda.Stream, deque[tuple[int, torch.cuda.Event]]] = {
+            stream: deque() for stream in (self.d2h_stream, self.h2d_stream)
+        }
         # list of cuda events available for re-use
+        self.events_pool_lock = threading.Lock()
         self.events_pool: list[torch.cuda.Event] = []
 
         pin_memory = is_pin_memory_available()
@@ -112,7 +119,29 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 )
             )
 
+        self._load_queue = queue.Queue()
+        self._store_queue = queue.Queue()
+        self.lock = threading.Lock()
+        self._load_thread = threading.Thread(target=self._worker, args=(self._load_queue,), daemon=True)
+        self._load_thread.start()
+        self._store_thread = threading.Thread(target=self._worker, args=(self._store_queue,), daemon=True)
+        self._store_thread.start()
+
+    def _worker(self, queue: queue.Queue):
+        while True:
+            job_id, spec = queue.get()
+            self._transfer_async(job_id, spec)
+            queue.task_done()
+
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        src_spec, dst_spec = spec
+        if isinstance(src_spec, CPULoadStoreSpec):
+            self._load_queue.put((job_id, spec))
+        else:
+            self._store_queue.put((job_id, spec))
+        return True
+
+    def _transfer_async(self, job_id: int, spec: TransferSpec):
         src_spec, dst_spec = spec
         if isinstance(src_spec, CPULoadStoreSpec):
             assert isinstance(dst_spec, GPULoadStoreSpec)
@@ -153,7 +182,8 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         )
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        event = self.events_pool.pop() if self.events_pool else torch.cuda.Event()
+        with self.events_pool_lock:
+            event = self.events_pool.pop() if self.events_pool else torch.cuda.Event()
         with torch.cuda.stream(stream):
             for src_tensor, dst_tensor, kv_dim in zip(
                 src_tensors, dst_tensors, self.kv_dim_before_num_blocks
@@ -161,25 +191,30 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 if kv_dim:
                     src_key_cache = src_tensor[0]
                     dst_key_cache = dst_tensor[0]
-                    ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
+                    mycuda.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
                     src_value_cache = src_tensor[1]
                     dst_value_cache = dst_tensor[1]
-                    ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
+                    mycuda.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
                 else:
-                    ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
+                    mycuda.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
             event.record(stream)
 
-        self.transfer_events[job_id] = event
-
-        # success
-        return True
+        with self.lock:
+            self.transfer_events[stream].append((job_id, event))
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        for job_id, event in self.transfer_events.items():
-            if event.query():
-                results.append((job_id, True))
-                self.events_pool.append(event)
-        for job_id, _ in results:
-            del self.transfer_events[job_id]
+        events = []
+        with self.lock:
+            for stream, events_deque in self.transfer_events.items():
+                while events_deque:
+                    job_id, event = events_deque[0]
+                    if event.query():
+                        results.append((job_id, True))
+                        events.append(event)
+                        events_deque.popleft()
+                    else:
+                        break
+        with self.events_pool_lock:
+            self.events_pool.extend(events)
         return results
