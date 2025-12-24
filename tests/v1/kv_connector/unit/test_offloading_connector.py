@@ -463,10 +463,13 @@ def test_offloading_connector(request_runner):
     runner.manager.prepare_store.side_effect = (
         lambda block_hashes: generate_store_output(list(block_hashes)[1:2])
     )
-    runner.run(decoded_tokens=[0], expected_stored_gpu_block_indexes=(3, 4, 5))
+    runner.run(decoded_tokens=[0])
 
     # add block missing 1 token -> no offload
-    runner.run(decoded_tokens=[0] * (offloaded_block_size - 1))
+    runner.run(
+        decoded_tokens=[0] * (offloaded_block_size - 1),
+        expected_stored_gpu_block_indexes=(3, 4, 5),
+    )
     runner.manager.prepare_store.assert_not_called()
 
     # +1 token -> single block, fail prepare_store
@@ -484,23 +487,20 @@ def test_offloading_connector(request_runner):
     runner.manager.prepare_store.side_effect = (
         lambda block_hashes: generate_store_output(block_hashes)
     )
-    runner.run(
-        decoded_tokens=[0] * offloaded_block_size,
-        expected_stored_gpu_block_indexes=(15, 16, 17),
-    )
+    runner.run(decoded_tokens=[0] * offloaded_block_size)
     runner.manager.touch.assert_called()
     block_hashes1 = list(runner.manager.touch.call_args.args[0])
     assert len(block_hashes1) == 6
 
     # terminate request
-    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored_gpu_block_indexes=(15, 16, 17),
+    )
 
     # create a new request differing only on the last token
     runner.new_request(token_ids=[0] * (offloaded_block_size * 6 - 1) + [1])
-    runner.run(
-        decoded_tokens=[0],
-        expected_stored_gpu_block_indexes=tuple(range(6 * block_size_factor)),
-    )
+    runner.run(decoded_tokens=[0])
     runner.manager.touch.assert_called()
     block_hashes2 = list(runner.manager.touch.call_args.args[0])
     assert len(block_hashes2) == 6
@@ -510,7 +510,10 @@ def test_offloading_connector(request_runner):
     assert block_hashes1[5] != block_hashes2[5]
 
     # terminate request
-    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored_gpu_block_indexes=tuple(range(6 * block_size_factor)),
+    )
 
     # full_block_tokens - num_computed_tokens < offloaded_block_size
     runner.new_request(
@@ -641,7 +644,9 @@ def test_request_preemption(request_runner):
     runner.run(
         decoded_tokens=[0] * gpu_block_size,
         expected_loaded_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
-        expected_stored_gpu_block_indexes=(9, 10, 11),
     )
 
-    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored_gpu_block_indexes=(9, 10, 11),
+    )
