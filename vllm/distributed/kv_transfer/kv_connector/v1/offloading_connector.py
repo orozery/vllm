@@ -386,7 +386,7 @@ class OffloadingConnectorScheduler:
         for req_id in scheduler_output.preempted_req_ids or ():
             block_hashes = self._reqs_being_stored.get(req_id)
             if block_hashes:
-                self.manager.complete_store(block_hashes)
+                self.manager.complete_store(block_hashes, success=False)
                 block_hashes.clear()
 
         return meta
