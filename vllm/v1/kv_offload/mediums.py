@@ -12,8 +12,11 @@ class BlockIDsLoadStoreSpec(LoadStoreSpec, ABC):
     Spec for loading/storing KV blocks from given block numbers.
     """
 
-    def __init__(self, block_ids: list[int]):
+    def __init__(self, block_ids: list[int], group_sizes: list[int] | None = None):
         self.block_ids = np.array(block_ids, dtype=np.int64)
+        self.group_sizes = (
+            np.array(group_sizes, dtype=np.int64) if group_sizes else None
+        )
 
     def __repr__(self) -> str:
         return repr(self.block_ids)

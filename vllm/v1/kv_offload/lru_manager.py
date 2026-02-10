@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
@@ -24,7 +24,7 @@ class LRUOffloadingManager(OffloadingManager):
         self.blocks: OrderedDict[BlockHash, BlockStatus] = OrderedDict()
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
 
-    def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
+    def maximal_prefix_lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
         hit_count = 0
         for block_hash in block_hashes:
             block = self.blocks.get(block_hash)
@@ -32,6 +32,22 @@ class LRUOffloadingManager(OffloadingManager):
                 break
             hit_count += 1
         return hit_count
+
+    def sliding_window_lookup(
+        self, block_hashes: Sequence[BlockHash], sliding_window_size: int
+    ) -> int | None:
+        hit_candidate = len(block_hashes)
+        pending_hits = min(sliding_window_size, hit_candidate)
+        for idx, block_hash in enumerate(reversed(block_hashes)):
+            block = self.blocks.get(block_hash)
+            if block is None or not block.is_ready:
+                hit_candidate -= 1
+                pending_hits = min(sliding_window_size, hit_candidate)
+            else:
+                pending_hits -= 1
+                if pending_hits == 0:
+                    break
+        return hit_candidate
 
     def prepare_load(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:
         blocks = []

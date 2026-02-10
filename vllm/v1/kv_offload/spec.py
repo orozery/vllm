@@ -22,7 +22,7 @@ class OffloadingSpec(ABC):
     """Spec for an offloading connector"""
 
     def __init__(
-        self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig | None"
+        self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
     ):
         logger.warning(
             "Initializing OffloadingSpec. This API is experimental and "
@@ -39,6 +39,7 @@ class OffloadingSpec(ABC):
         self.offloaded_block_size = int(
             self.extra_config.get("block_size", self.gpu_block_size)
         )
+        self.num_kv_groups = len(kv_cache_config.kv_cache_groups)
 
         assert self.offloaded_block_size % self.gpu_block_size == 0
 

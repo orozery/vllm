@@ -97,6 +97,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         min_block_size_factor = min(src_block_size_factor, dst_block_size_factor)
         self.src_block_size_factor: int = src_block_size_factor // min_block_size_factor
         self.dst_block_size_factor: int = dst_block_size_factor // min_block_size_factor
+        self.src_to_dst_block_size_factor: int = (
+            src_block_size_factor // dst_block_size_factor
+        )
 
         self.block_size_in_bytes = [
             tensor.element_size() * tensor.stride(0) * min_block_size_factor
@@ -125,22 +128,52 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         dst_blocks = dst_spec.block_ids
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
+        num_src_blocks = len(src_blocks)
+        num_dst_blocks = len(dst_blocks)
 
-        src_sub_block_count = src_blocks.size * self.src_block_size_factor
-        dst_sub_block_count = dst_blocks.size * self.dst_block_size_factor
-        src_sub_blocks_to_skip = -dst_blocks.size % self.src_block_size_factor
+        max_sub_blocks = len(src_blocks) * self.src_block_size_factor
+        assert not src_spec.group_sizes
+        group_sizes = dst_spec.group_sizes
+        if group_sizes is None:
+            group_sizes = [len(dst_blocks)]
 
-        assert dst_sub_block_count == src_sub_block_count - src_sub_blocks_to_skip
+        src_to_dst = np.empty((max_sub_blocks, 2), dtype=np.int64)
+        src_offset = 0
+        dst_offset = 0
+        output_offset = 0
+        for group_size in group_sizes:
+            dst_end_offset = dst_offset + group_size
+            assert dst_end_offset <= num_dst_blocks
 
-        src_to_dst = np.empty((dst_sub_block_count, 2), dtype=np.int64)
-        expand_block_ids(
-            src_blocks,
-            self.src_block_size_factor,
-            src_to_dst[:, 0],
-            skip_count=src_sub_blocks_to_skip,
-        )
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
-        src_to_dst_tensor = torch.from_numpy(src_to_dst)
+            dst_sub_block_count = group_size * self.dst_block_size_factor
+            src_sub_blocks_to_skip = -group_size % self.src_block_size_factor
+            src_sub_block_count = dst_sub_block_count + src_sub_blocks_to_skip
+
+            assert src_sub_block_count % self.src_block_size_factor == 0
+            src_blocks_count = src_sub_block_count // self.src_block_size_factor
+            src_end_offset = src_offset + src_blocks_count
+            assert src_end_offset <= num_src_blocks
+
+            expand_block_ids(
+                src_blocks[src_offset:src_offset+src_blocks_count],
+                self.src_block_size_factor,
+                src_to_dst[output_offset:, 0],
+                skip_count=src_sub_blocks_to_skip,
+            )
+            expand_block_ids(
+                dst_blocks[dst_offset:dst_end_offset],
+                self.dst_block_size_factor,
+                src_to_dst[output_offset:, 1],
+            )
+
+            src_offset = src_end_offset
+            dst_offset = dst_end_offset
+            output_offset += dst_sub_block_count
+
+        assert src_offset == num_src_blocks
+        assert dst_offset == num_dst_blocks
+
+        src_to_dst_tensor = torch.from_numpy(src_to_dst[:output_offset])
 
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
         start_event = (
