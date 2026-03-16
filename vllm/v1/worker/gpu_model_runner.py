@@ -409,6 +409,7 @@ class GPUModelRunner(
         parallel_config = self.parallel_config
         self.device = device
         self.pin_memory = is_pin_memory_available()
+        self.use_uva_copies = envs.VLLM_USE_UVA_COPIES and self.pin_memory
         self.dtype = self.model_config.dtype
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -622,6 +623,7 @@ class GPUModelRunner(
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            use_uva=self.use_uva_copies,
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -714,6 +716,31 @@ class GPUModelRunner(
                 (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
             )
 
+        # Pre-allocated pinned+UVA+GPU buffer pairs for scatter index H2D
+        # copies. Used in _prepare_inputs_async_scheduling to avoid ad-hoc
+        # torch.tensor().to(device) which uses the DMA copy engine.
+        # Two pairs needed: scatter uses two index tensors simultaneously.
+        self._scatter_idx_bufs: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] | None = None
+        if self.use_uva_copies:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+            bufs = []
+            for _ in range(2):
+                pinned = torch.empty(
+                    self.max_num_tokens,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                uva = get_accelerator_view_from_cpu_tensor(pinned)
+                gpu = torch.empty(
+                    self.max_num_tokens, dtype=torch.int64, device=self.device
+                )
+                bufs.append((pinned, uva, gpu))
+            self._scatter_idx_bufs = bufs
+
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
 
@@ -780,6 +807,16 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        # UVA view for D2H Triton copy of sampled_token_ids
+        self.sampled_token_ids_pinned_uva: torch.Tensor | None = None
+        if self.use_uva_copies and self.pin_memory:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+            self.sampled_token_ids_pinned_uva = (
+                get_accelerator_view_from_cpu_tensor(
+                    self.sampled_token_ids_pinned_cpu
+                )
+            )
 
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
@@ -790,7 +827,9 @@ class GPUModelRunner(
         self.draft_token_ids_event: torch.Event | None = None
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
+        self.valid_sampled_token_count_uva: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
+        self.draft_token_ids_uva: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
@@ -802,6 +841,16 @@ class GPUModelRunner(
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
+            if self.use_uva_copies and self.pin_memory:
+                from vllm.utils.torch_utils import (
+                    get_accelerator_view_from_cpu_tensor,
+                )
+
+                self.draft_token_ids_uva = (
+                    get_accelerator_view_from_cpu_tensor(
+                        self.draft_token_ids_cpu
+                    )
+                )
             if self.use_async_scheduling:
                 self.valid_sampled_token_count_event = torch.Event()
                 self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
@@ -811,6 +860,16 @@ class GPUModelRunner(
                     device="cpu",
                     pin_memory=self.pin_memory,
                 )
+                if self.use_uva_copies and self.pin_memory:
+                    from vllm.utils.torch_utils import (
+                        get_accelerator_view_from_cpu_tensor,
+                    )
+
+                    self.valid_sampled_token_count_uva = (
+                        get_accelerator_view_from_cpu_tensor(
+                            self.valid_sampled_token_count_cpu
+                        )
+                    )
 
         # Model weight offloader
         # Make sure this is called before any get_offloader call
@@ -915,7 +974,34 @@ class GPUModelRunner(
             device=self.device,
             pin_memory=self.pin_memory,
             with_numpy=numpy,
+            use_uva=self.use_uva_copies,
         )
+
+    def _upload_scatter_indices(
+        self, indices: list[int], buf_idx: int = 0
+    ) -> torch.Tensor:
+        """Upload a list of int64 indices to GPU.
+
+        When UVA copies are enabled, uses pre-allocated pinned+UVA buffers
+        with a Triton SM copy. Otherwise falls back to the ad-hoc
+        torch.tensor().to(device) pattern.
+
+        Args:
+            indices: List of integer indices to upload.
+            buf_idx: Which buffer pair to use (0 or 1). Use different
+                values for tensors that are needed simultaneously.
+        """
+        n = len(indices)
+        if self._scatter_idx_bufs is not None:
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            pinned, uva, gpu = self._scatter_idx_bufs[buf_idx]
+            pinned[:n].copy_(torch.tensor(indices, dtype=torch.int64))
+            uva_copy(uva, gpu, n)
+            return gpu[:n]
+        return torch.tensor(
+            indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
 
     def _get_mamba_copy_bufs(self) -> mamba_utils.MambaCopyBuffers:
         if self._mamba_copy_bufs is None:
@@ -992,7 +1078,8 @@ class GPUModelRunner(
         Delegates to KVBlockZeroer.init_meta with the runner's state.
         Called from gpu_worker.py outside the CuMem pool context.
         """
-        self._kv_block_zeroer = KVBlockZeroer(self.device, self.pin_memory)
+        self._kv_block_zeroer = KVBlockZeroer(
+            self.device, self.pin_memory, use_uva=self.use_uva_copies)
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self._kernel_block_sizes,
@@ -1372,9 +1459,18 @@ class GPUModelRunner(
                 self._get_mamba_copy_bufs(),
             )
         else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-            )
+            if self.input_batch.num_accepted_tokens_cpu_uva is not None:
+                from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+                uva_copy(
+                    self.num_accepted_tokens.gpu,
+                    self.input_batch.num_accepted_tokens_cpu_uva,
+                    num_reqs,
+                )
+            else:
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
@@ -1583,12 +1679,12 @@ class GPUModelRunner(
                 self.is_token_ids.gpu[:num_common_tokens] = True
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        sampled_tokens_index_tensor = self._upload_scatter_indices(
+            sample_flattened_indices, buf_idx=0
+        )
+        prev_common_req_indices_tensor = self._upload_scatter_indices(
+            prev_common_req_indices, buf_idx=1
+        )
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
@@ -1602,12 +1698,12 @@ class GPUModelRunner(
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        draft_tokens_index_tensor = self._upload_scatter_indices(
+            spec_flattened_indices, buf_idx=0
+        )
+        prev_draft_token_indices_tensor = self._upload_scatter_indices(
+            prev_draft_token_indices, buf_idx=1
+        )
 
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
@@ -4171,9 +4267,16 @@ class GPUModelRunner(
             if not zeros_only:
                 # Trigger async copy of draft token ids to cpu.
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
-                self.draft_token_ids_cpu[:num_reqs].copy_(
-                    draft_token_ids, non_blocking=True
-                )
+                if self.draft_token_ids_uva is not None:
+                    from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+                    uva_copy(
+                        draft_token_ids, self.draft_token_ids_uva, num_reqs
+                    )
+                else:
+                    self.draft_token_ids_cpu[:num_reqs].copy_(
+                        draft_token_ids, non_blocking=True
+                    )
             else:
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs] = 0
@@ -4204,7 +4307,16 @@ class GPUModelRunner(
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
             assert counts_cpu is not None
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
+            if self.valid_sampled_token_count_uva is not None:
+                from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+                uva_copy(
+                    counts,
+                    self.valid_sampled_token_count_uva,
+                    counts.shape[0],
+                )
+            else:
+                counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
 
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
@@ -6218,6 +6330,7 @@ class GPUModelRunner(
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
+                use_uva=self.use_uva_copies,
             )
 
         assert self._init_block_sizes == block_sizes, (
@@ -6655,8 +6768,14 @@ class GPUModelRunner(
         # this is in the critical path of every single model
         # forward loop, this has caused perf issue for a disagg
         # setup.
-        pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
-        pinned.copy_(sampled_token_ids, non_blocking=True)
+        n = sampled_token_ids.shape[0]
+        pinned = self.sampled_token_ids_pinned_cpu[:n]
+        if self.sampled_token_ids_pinned_uva is not None:
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            uva_copy(sampled_token_ids, self.sampled_token_ids_pinned_uva, n)
+        else:
+            pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()

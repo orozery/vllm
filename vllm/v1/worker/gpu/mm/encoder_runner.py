@@ -3,9 +3,11 @@
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
+from vllm.utils import is_pin_memory_available
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
@@ -26,6 +28,7 @@ class EncoderRunner:
         self.encoder_cache = encoder_cache
         self.dtype = dtype
         self.device = device
+        self.use_uva = envs.VLLM_USE_UVA_COPIES and is_pin_memory_available()
 
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
@@ -132,7 +135,20 @@ class EncoderRunner:
                 mm_embeds.append(mm_embeds_item)
 
         # Copy the is_mm_embed tensor to the GPU.
-        is_mm_embed = is_mm_embed.to(device=self.device, non_blocking=True)
+        if self.use_uva:
+            from vllm.utils.torch_utils import (
+                get_accelerator_view_from_cpu_tensor,
+            )
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            uva_view = get_accelerator_view_from_cpu_tensor(is_mm_embed)
+            is_mm_embed_gpu = torch.empty_like(
+                is_mm_embed, device=self.device
+            )
+            uva_copy(uva_view, is_mm_embed_gpu)
+            is_mm_embed = is_mm_embed_gpu
+        else:
+            is_mm_embed = is_mm_embed.to(device=self.device, non_blocking=True)
         return mm_embeds, is_mm_embed
 
     @torch.inference_mode()

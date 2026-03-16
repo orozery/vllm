@@ -85,12 +85,15 @@ class KVBlockZeroer:
     newly-allocated blocks.
     """
 
-    def __init__(self, device: torch.device, pin_memory: bool):
+    def __init__(self, device: torch.device, pin_memory: bool,
+                 use_uva: bool = False):
         self.device = device
         self.pin_memory = pin_memory
+        self.use_uva = use_uva and pin_memory
         self._meta: tuple[torch.Tensor, int, int, int] | None = None
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
+        self._ids_uva: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
 
     def init_meta(
@@ -179,6 +182,15 @@ class KVBlockZeroer:
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+        self._ids_uva = None
+        if self.use_uva:
+            from vllm.utils.torch_utils import (
+                get_accelerator_view_from_cpu_tensor,
+            )
+
+            self._ids_uva = get_accelerator_view_from_cpu_tensor(
+                self._ids_pinned
+            )
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.int64, device=self.device),
             page_size_el,
@@ -202,10 +214,24 @@ class KVBlockZeroer:
             self._ids_gpu = torch.empty(
                 self._id_cap, dtype=torch.int64, device=self.device
             )
+            self._ids_uva = None
+            if self.use_uva:
+                from vllm.utils.torch_utils import (
+                    get_accelerator_view_from_cpu_tensor,
+                )
+
+                self._ids_uva = get_accelerator_view_from_cpu_tensor(
+                    self._ids_pinned
+                )
         assert self._ids_pinned is not None and self._ids_gpu is not None
         self._ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[:n_blocks]
-        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
+        if self._ids_uva is not None:
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            uva_copy(self._ids_uva, idx, n_blocks)
+        else:
+            idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
         grid = (n_blocks * n_segs * (page_size_el // blk_size),)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,

@@ -193,6 +193,90 @@ class StagedWriteTensor:
 
 
 @triton.jit
+def _uva_copy_kernel(
+    src_ptr,
+    dst_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel that copies data via SM load/store (UVA).
+
+    Works for both H2D (src=UVA pinned CPU, dst=GPU) and
+    D2H (src=GPU, dst=UVA pinned CPU). Each program instance
+    handles a strided chunk of the total elements.
+    """
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+
+    # Each program handles elements: pid, pid+num_programs, pid+2*num_programs, ...
+    # but we process in BLOCK_SIZE chunks per program for efficiency.
+    # Divide work evenly: each program gets a contiguous chunk.
+    chunk_size = tl.cdiv(n_elements, num_programs)
+    start = pid * chunk_size
+    end = tl.minimum(start + chunk_size, n_elements)
+
+    for i in range(start, end, BLOCK_SIZE):
+        block_offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = block_offsets < end
+        data = tl.load(src_ptr + block_offsets, mask=mask)
+        tl.store(dst_ptr + block_offsets, data, mask=mask)
+
+
+def _get_num_programs(n_elements: int) -> int:
+    """Auto-scale the number of Triton programs based on copy size."""
+    if n_elements <= 1024:
+        return 1
+    elif n_elements <= 8192:
+        return 2
+    elif n_elements <= 65536:
+        return 4
+    else:
+        return 8
+
+
+def uva_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    n: int | None = None,
+) -> torch.Tensor:
+    """Copy data between CPU (pinned/UVA) and GPU using Triton SM load/store.
+
+    This uses SM instructions instead of the DMA copy engine, freeing
+    the copy engine for KV cache offloading transfers.
+
+    Args:
+        src: Source tensor (CPU-pinned/UVA or GPU).
+        dst: Destination tensor (GPU or CPU-pinned/UVA).
+        n: Number of leading elements to copy. If None, copies all.
+
+    Returns:
+        The destination tensor (sliced to [:n] if n is provided).
+    """
+    if n is not None and n > 0:
+        src = src[:n]
+        dst = dst[:n]
+    elif n == 0:
+        return dst
+
+    # Flatten for the kernel (contiguous 1D copy)
+    n_elements = src.numel()
+    if n_elements == 0:
+        return dst
+
+    src_flat = src.reshape(-1)
+    dst_flat = dst.reshape(-1)
+
+    num_programs = _get_num_programs(n_elements)
+    _uva_copy_kernel[(num_programs,)](
+        src_flat,
+        dst_flat,
+        n_elements,
+        BLOCK_SIZE=1024,
+    )
+    return dst
+
+
+@triton.jit
 def _apply_write_kernel(
     output_ptr,
     output_stride,

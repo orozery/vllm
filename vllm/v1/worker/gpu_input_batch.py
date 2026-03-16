@@ -95,6 +95,7 @@ class InputBatch:
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
+        use_uva: bool = False,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -216,6 +217,48 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
+
+        # UVA views for Triton SM-based copies (instead of DMA engine).
+        self.use_uva = use_uva and pin_memory
+        self.temperature_cpu_uva: torch.Tensor | None = None
+        self.top_p_cpu_uva: torch.Tensor | None = None
+        self.top_k_cpu_uva: torch.Tensor | None = None
+        self.frequency_penalties_cpu_uva: torch.Tensor | None = None
+        self.presence_penalties_cpu_uva: torch.Tensor | None = None
+        self.repetition_penalties_cpu_uva: torch.Tensor | None = None
+        self.num_accepted_tokens_cpu_uva: torch.Tensor | None = None
+        if self.use_uva:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+            self.temperature_cpu_uva = get_accelerator_view_from_cpu_tensor(
+                self.temperature_cpu_tensor
+            )
+            self.top_p_cpu_uva = get_accelerator_view_from_cpu_tensor(
+                self.top_p_cpu_tensor
+            )
+            self.top_k_cpu_uva = get_accelerator_view_from_cpu_tensor(
+                self.top_k_cpu_tensor
+            )
+            self.frequency_penalties_cpu_uva = (
+                get_accelerator_view_from_cpu_tensor(
+                    self.frequency_penalties_cpu_tensor
+                )
+            )
+            self.presence_penalties_cpu_uva = (
+                get_accelerator_view_from_cpu_tensor(
+                    self.presence_penalties_cpu_tensor
+                )
+            )
+            self.repetition_penalties_cpu_uva = (
+                get_accelerator_view_from_cpu_tensor(
+                    self.repetition_penalties_cpu_tensor
+                )
+            )
+            self.num_accepted_tokens_cpu_uva = (
+                get_accelerator_view_from_cpu_tensor(
+                    self.num_accepted_tokens_cpu_tensor
+                )
+            )
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
@@ -781,29 +824,49 @@ class InputBatch:
         num_reqs = self.num_reqs
         if not self.all_greedy:
             temperature = copy_slice(
-                self.temperature_cpu_tensor, self.temperature, num_reqs
+                self.temperature_cpu_tensor,
+                self.temperature,
+                num_reqs,
+                from_uva=self.temperature_cpu_uva,
             )
         else:
             temperature = None
         if not self.no_top_p:
-            copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
+            copy_slice(
+                self.top_p_cpu_tensor,
+                self.top_p,
+                num_reqs,
+                from_uva=self.top_p_cpu_uva,
+            )
         if not self.no_top_k:
-            copy_slice(self.top_k_cpu_tensor, self.top_k, num_reqs)
+            copy_slice(
+                self.top_k_cpu_tensor,
+                self.top_k,
+                num_reqs,
+                from_uva=self.top_k_cpu_uva,
+            )
 
         if not self.no_penalties:
             # Since syncing these tensors is expensive only copy them
             # if necessary i.e. if there are requests which require
             # penalties to be applied during sampling.
             copy_slice(
-                self.frequency_penalties_cpu_tensor, self.frequency_penalties, num_reqs
+                self.frequency_penalties_cpu_tensor,
+                self.frequency_penalties,
+                num_reqs,
+                from_uva=self.frequency_penalties_cpu_uva,
             )
             copy_slice(
-                self.presence_penalties_cpu_tensor, self.presence_penalties, num_reqs
+                self.presence_penalties_cpu_tensor,
+                self.presence_penalties,
+                num_reqs,
+                from_uva=self.presence_penalties_cpu_uva,
             )
             copy_slice(
                 self.repetition_penalties_cpu_tensor,
                 self.repetition_penalties,
                 num_reqs,
+                from_uva=self.repetition_penalties_cpu_uva,
             )
 
         needs_prompt_token_ids = (
@@ -895,6 +958,22 @@ class InputBatch:
         # token_id of this value.
         for i in range(num_reqs):
             prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.vocab_size
+        if self.use_uva:
+            from vllm.utils.torch_utils import (
+                get_accelerator_view_from_cpu_tensor,
+            )
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            uva_view = get_accelerator_view_from_cpu_tensor(
+                prompt_token_ids_cpu_tensor
+            )
+            gpu_tensor = torch.empty(
+                (num_reqs, max_prompt_len),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            uva_copy(uva_view, gpu_tensor)
+            return gpu_tensor
         return prompt_token_ids_cpu_tensor.to(device=self.device, non_blocking=True)
 
     def make_lora_inputs(

@@ -244,6 +244,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = False
+    VLLM_USE_UVA_COPIES: bool = False
 
 
 def get_default_cache_root():
@@ -1627,6 +1628,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory allocation. Disabled by default to preserve existing behavior.
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0"))
+    ),
+    # Use Triton UVA copy kernels instead of DMA (cudaMemcpyAsync) for
+    # small H2D/D2H transfers. This frees the DMA copy engines for KV
+    # cache offloading. Default off; auto-enabled when KV offloading is
+    # active.
+    "VLLM_USE_UVA_COPIES": lambda: bool(
+        int(os.getenv("VLLM_USE_UVA_COPIES", "0"))
     ),
 }
 

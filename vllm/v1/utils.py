@@ -112,6 +112,7 @@ class CpuGpuBuffer:
         device: torch.device,
         pin_memory: bool,
         with_numpy: bool = True,
+        use_uva: bool = False,
     ) -> None:
         self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
         self.gpu = torch.zeros_like(self.cpu, device=device)
@@ -127,7 +128,20 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
+        # UVA mode: create a UVA view of the pinned CPU tensor so that
+        # Triton kernels can read/write it via SM load/store instead of
+        # using the DMA copy engine.
+        self.uva: torch.Tensor | None = None
+        if use_uva and pin_memory:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+            self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
+
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+        if self.uva is not None:
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            return uva_copy(self.uva, self.gpu, n)
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
@@ -135,6 +149,10 @@ class CpuGpuBuffer:
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
+        if self.uva is not None:
+            from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+            return uva_copy(self.gpu, self.uva, n)
         if n is None:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
@@ -320,7 +338,10 @@ def shutdown(procs: list[BaseProcess]):
 
 
 def copy_slice(
-    from_tensor: torch.Tensor, to_tensor: torch.Tensor, length: int
+    from_tensor: torch.Tensor,
+    to_tensor: torch.Tensor,
+    length: int,
+    from_uva: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Copy the first length elements of a tensor into another tensor in a
@@ -328,8 +349,19 @@ def copy_slice(
 
     Used to copy pinned CPU tensor data to pre-allocated GPU tensors.
 
+    Args:
+        from_tensor: Source tensor (CPU pinned).
+        to_tensor: Destination tensor (GPU).
+        length: Number of leading elements to copy.
+        from_uva: Optional UVA view of from_tensor. If provided, use
+            Triton SM copy instead of DMA.
+
     Returns the sliced target tensor.
     """
+    if from_uva is not None:
+        from vllm.v1.worker.gpu.buffer_utils import uva_copy
+
+        return uva_copy(from_uva, to_tensor, length)
     return to_tensor[:length].copy_(from_tensor[:length], non_blocking=True)
 
 

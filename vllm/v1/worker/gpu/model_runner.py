@@ -46,7 +46,13 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
-from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
+import vllm.envs as envs
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.worker.gpu.async_utils import (
+    AsyncOutput,
+    AsyncPoolingOutput,
+    D2HCopyBuffers,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
@@ -130,6 +136,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
         self.output_copy_event = torch.cuda.Event()
+
+        # Pre-allocated UVA buffers for async D2H copies.
+        self.d2h_copy_buffers: D2HCopyBuffers | None = None
+        if envs.VLLM_USE_UVA_COPIES and is_pin_memory_available():
+            self.d2h_copy_buffers = D2HCopyBuffers.create(
+                max_num_reqs=self.max_num_reqs,
+            )
 
         # Pipeline parallelism.
         self.pp_size = self.parallel_config.pipeline_parallel_size
@@ -1124,6 +1137,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             copy_event=self.output_copy_event,
+            d2h_buffers=self.d2h_copy_buffers,
         )
 
         # Postprocess results and update request states.
