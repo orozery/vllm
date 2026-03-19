@@ -23,6 +23,8 @@
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
 typedef __hip_bfloat16 __nv_bfloat16;
+#else
+  #include <cuda.h>
 #endif
 
 #if defined(__gfx942__)
@@ -70,6 +72,62 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
     cudaMemcpyAsync(dst_ptr + dst_offset, src_ptr + src_offset,
                     block_size_in_bytes, memcpy_type, stream);
   }
+}
+
+void swap_blocks_batch(const torch::Tensor& src_ptrs,
+                       const torch::Tensor& dst_ptrs,
+                       const torch::Tensor& sizes,
+                       bool is_d2h) {
+  TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
+  TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
+  TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
+  TORCH_CHECK(src_ptrs.dtype() == torch::kInt64, "src_ptrs must be int64");
+  TORCH_CHECK(dst_ptrs.dtype() == torch::kInt64, "dst_ptrs must be int64");
+  TORCH_CHECK(sizes.dtype() == torch::kInt64, "sizes must be int64");
+
+  const int64_t n = src_ptrs.size(0);
+  TORCH_CHECK(dst_ptrs.size(0) == n, "dst_ptrs length must match src_ptrs");
+  TORCH_CHECK(sizes.size(0) == n, "sizes length must match src_ptrs");
+
+  if (n == 0) return;
+
+  const int64_t* src_data = src_ptrs.data_ptr<int64_t>();
+  const int64_t* dst_data = dst_ptrs.data_ptr<int64_t>();
+  const int64_t* size_data = sizes.data_ptr<int64_t>();
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // cuMemcpyBatchAsync (CUDA 12.8+) submits all copies in a single driver call.
+  // int64_t and CUdeviceptr/size_t are all 8 bytes on 64-bit platforms,
+  // so we cast the tensor data pointers directly to avoid copying.
+  static_assert(sizeof(CUdeviceptr) == sizeof(int64_t));
+  static_assert(sizeof(size_t) == sizeof(int64_t));
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  // One attribute entry covering all copies (from index 0).
+  CUmemcpyAttributes attr = {};
+  attr.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+  size_t attrs_idx = 0;
+  size_t fail_idx = 0;
+  CUresult result = cuMemcpyBatchAsync(
+      reinterpret_cast<CUdeviceptr*>(const_cast<int64_t*>(dst_data)),
+      reinterpret_cast<CUdeviceptr*>(const_cast<int64_t*>(src_data)),
+      reinterpret_cast<size_t*>(const_cast<int64_t*>(size_data)),
+      static_cast<size_t>(n),
+      &attr, &attrs_idx, 1,
+      &fail_idx, static_cast<CUstream>(stream));
+  TORCH_CHECK(result == CUDA_SUCCESS,
+              "cuMemcpyBatchAsync failed at index ", fail_idx,
+              " with error ", result);
+#else
+  #error "cuMemcpyBatchAsync not available — expected CUDA 12.8+"
+  cudaMemcpyKind kind =
+      is_d2h ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+  for (int64_t i = 0; i < n; i++) {
+    cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
+                    reinterpret_cast<void*>(src_data[i]),
+                    static_cast<size_t>(size_data[i]), kind, stream);
+  }
+#endif
 }
 
 namespace vllm {

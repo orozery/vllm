@@ -140,7 +140,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             skip_count=src_sub_blocks_to_skip,
         )
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
-        src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
         start_event = (
@@ -164,17 +163,42 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             stream.wait_event(last_event)
         with torch.cuda.stream(stream):
             start_event.record(stream)
-            for src_tensor, dst_tensor, block_size_in_bytes in zip(
-                self.src_tensors,
-                self.dst_tensors,
-                self.block_size_in_bytes,
-            ):
-                ops.swap_blocks(
-                    src_tensor,
-                    dst_tensor,
-                    block_size_in_bytes,
-                    src_to_dst_tensor,
+
+            src_block_ids = src_to_dst[:, 0]
+            dst_block_ids = src_to_dst[:, 1]
+            num_pairs = len(src_block_ids)
+            num_tensors = len(self.src_tensors)
+            total = num_pairs * num_tensors
+
+            all_src = np.empty(total, dtype=np.int64)
+            all_dst = np.empty(total, dtype=np.int64)
+            all_sizes = np.empty(total, dtype=np.int64)
+
+            for t_idx, (src_tensor, dst_tensor, bsz) in enumerate(
+                zip(
+                    self.src_tensors,
+                    self.dst_tensors,
+                    self.block_size_in_bytes,
                 )
+            ):
+                start = t_idx * num_pairs
+                end = start + num_pairs
+                all_src[start:end] = (
+                    src_tensor.data_ptr() + src_block_ids * bsz
+                )
+                all_dst[start:end] = (
+                    dst_tensor.data_ptr() + dst_block_ids * bsz
+                )
+                all_sizes[start:end] = bsz
+
+            if total > 0:
+                ops.swap_blocks_batch(
+                    torch.from_numpy(all_src),
+                    torch.from_numpy(all_dst),
+                    torch.from_numpy(all_sizes),
+                    self.gpu_to_cpu,
+                )
+
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
