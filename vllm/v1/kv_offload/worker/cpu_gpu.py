@@ -136,11 +136,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         for kv_cache_group_data_refs in kv_cache_groups_data_refs:
             group_block_size_in_bytes = 0
             for kv_cache_data_ref in kv_cache_group_data_refs:
-                # TODO(orozery): use kv_cache_data_ref.page_size_bytes
-                # once swap_blocks support it
-                group_block_size_in_bytes += self.tensor_block_size_in_bytes[
-                    kv_cache_data_ref.tensor_idx
-                ]
+                group_block_size_in_bytes += kv_cache_data_ref.page_size_bytes
             self.group_block_size_in_bytes.append(group_block_size_in_bytes)
 
         self._default_block_indices = [0] * len(kv_cache_groups_data_refs)
@@ -207,12 +203,12 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # count total number of bytes copied
         num_transfer_bytes = 0
         # per group src_to_dst mapping
-        src_to_dst_tensors = []
+        src_to_dst_list = []
         for group_size, block_idx, group_block_size in zip(
             group_sizes, block_indices, self.group_block_size_in_bytes
         ):
             if group_size == 0:
-                src_to_dst_tensors.append(torch.empty((0, 2), dtype=torch.int64))
+                src_to_dst_list.append(np.empty((0, 2), dtype=np.int64))
                 continue
 
             # calculate in logical (GPU) blocks
@@ -248,7 +244,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 self.dst_block_size_factor,
                 src_to_dst[:, 1],
             )
-            src_to_dst_tensors.append(torch.from_numpy(src_to_dst))
+            src_to_dst_list.append(src_to_dst)
             num_transfer_bytes += dst_logical_blocks_count * group_block_size
 
             src_offset = src_end_offset
@@ -279,17 +275,52 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             stream.wait_event(last_event)
         with torch.cuda.stream(stream):
             start_event.record(stream)
-            for kv_cache_group_data_refs, src_to_dst_tensor in zip(
-                self.kv_cache_groups_data_refs, src_to_dst_tensors
+
+            # Build batched swap_blocks_batch call across all groups and tensors
+            all_src_addrs: list[np.ndarray] = []
+            all_dst_addrs: list[np.ndarray] = []
+            all_sizes_list: list[np.ndarray] = []
+
+            for kv_cache_group_data_refs, src_to_dst in zip(
+                self.kv_cache_groups_data_refs, src_to_dst_list
             ):
+                if len(src_to_dst) == 0:
+                    continue
+                src_block_ids = src_to_dst[:, 0]
+                dst_block_ids = src_to_dst[:, 1]
+                num_pairs = len(src_block_ids)
+
                 for kv_cache_data_ref in kv_cache_group_data_refs:
                     tensor_idx = kv_cache_data_ref.tensor_idx
-                    ops.swap_blocks(
-                        self.src_tensors[tensor_idx],
-                        self.dst_tensors[tensor_idx],
-                        self.tensor_block_size_in_bytes[tensor_idx],
-                        src_to_dst_tensor,
-                    )
+                    src_tensor = self.src_tensors[tensor_idx]
+                    dst_tensor = self.dst_tensors[tensor_idx]
+                    # Use the un-padded page size so we only copy
+                    # the actual data, not the padding.
+                    bsz = kv_cache_data_ref.page_size_bytes
+
+                    src_addrs = np.empty(num_pairs, dtype=np.int64)
+                    dst_addrs = np.empty(num_pairs, dtype=np.int64)
+                    sizes = np.empty(num_pairs, dtype=np.int64)
+
+                    # Stride by the tensor's (padded) block size for addressing,
+                    # but copy only the un-padded page size.
+                    stride = self.tensor_block_size_in_bytes[tensor_idx]
+                    src_addrs[:] = src_tensor.data_ptr() + src_block_ids * stride
+                    dst_addrs[:] = dst_tensor.data_ptr() + dst_block_ids * stride
+                    sizes[:] = bsz
+
+                    all_src_addrs.append(src_addrs)
+                    all_dst_addrs.append(dst_addrs)
+                    all_sizes_list.append(sizes)
+
+            if all_src_addrs:
+                ops.swap_blocks_batch(
+                    torch.from_numpy(np.concatenate(all_src_addrs)),
+                    torch.from_numpy(np.concatenate(all_dst_addrs)),
+                    torch.from_numpy(np.concatenate(all_sizes_list)),
+                    self.gpu_to_cpu,
+                )
+
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
