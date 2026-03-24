@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, SlidingWindowSpec
 from vllm.v1.kv_offload.abstract import (
     OffloadingManager,
     OffloadKey,
@@ -37,6 +38,8 @@ class GroupOffloadSpec(NamedTuple):
     gpu_block_size: int
     offloaded_block_size: int
     hash_block_size_factor: int
+    # None below means full attention
+    sliding_window_size_in_blocks: int | None
 
 
 @dataclass
@@ -45,6 +48,9 @@ class RequestGroupState:
     block_ids: list[int] = field(default_factory=list)
     # index of next block (of size offloaded_block_size) to offload
     next_stored_block_idx: int = 0
+    # number of offloaded blocks hit (including GPU prefix cache)
+    # when the request first started
+    num_hit_blocks: int = 0
 
 
 @dataclass(slots=True)
@@ -66,16 +72,38 @@ class RequestOffloadState:
     @classmethod
     def init_class(cls, spec: OffloadingSpec) -> None:
         cls.BLOCK_SIZE_FACTOR = spec.block_size_factor
-        cls.KV_GROUP_CONFIGS = tuple(
-            GroupOffloadSpec(
-                group_idx=idx,
-                gpu_block_size=gpu_block_size,
-                offloaded_block_size=gpu_block_size * spec.block_size_factor,
-                hash_block_size_factor=(gpu_block_size * spec.block_size_factor)
-                // spec.hash_block_size,
+
+        # build per-group offloading config
+        group_configs: list[GroupOffloadSpec] = []
+        for idx, group in enumerate(spec.kv_cache_config.kv_cache_groups):
+            kv_cache_spec = group.kv_cache_spec
+            gpu_block_size = kv_cache_spec.block_size
+            offloaded_block_size = gpu_block_size * spec.block_size_factor
+            hash_block_size_factor = offloaded_block_size // spec.hash_block_size
+
+            sliding_window_size_in_blocks: int | None
+            if isinstance(kv_cache_spec, SlidingWindowSpec):
+                assert kv_cache_spec.sliding_window > 0
+                sliding_window_size_in_blocks = cdiv(
+                    kv_cache_spec.sliding_window, offloaded_block_size
+                )
+            elif isinstance(kv_cache_spec, MambaSpec):
+                # Mamba depends on a single state
+                sliding_window_size_in_blocks = 1
+            else:
+                assert isinstance(kv_cache_spec, AttentionSpec)
+                sliding_window_size_in_blocks = None
+
+            group_configs.append(
+                GroupOffloadSpec(
+                    group_idx=idx,
+                    gpu_block_size=gpu_block_size,
+                    offloaded_block_size=offloaded_block_size,
+                    hash_block_size_factor=hash_block_size_factor,
+                    sliding_window_size_in_blocks=sliding_window_size_in_blocks,
+                )
             )
-            for idx, gpu_block_size in enumerate(spec.gpu_block_size)
-        )
+        cls.KV_GROUP_CONFIGS = tuple(group_configs)
 
     def update_offload_keys(self) -> None:
         for group_config, group_state in zip(
@@ -110,6 +138,14 @@ class RequestOffloadState:
             num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
             group_state.next_stored_block_idx = num_blocks
 
+    def update_num_hit_blocks(self, num_cached_tokens: int) -> None:
+        for group_config, group_state in zip(
+            RequestOffloadState.KV_GROUP_CONFIGS, self.group_states
+        ):
+            group_state.num_hit_blocks = (
+                num_cached_tokens // group_config.offloaded_block_size
+            )
+
 
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -118,12 +154,26 @@ class OffloadingConnectorScheduler:
         RequestOffloadState.init_class(spec)
         self.manager: OffloadingManager = spec.get_manager()
 
-        attention_groups: list[int] = []
-        for idx, _ in enumerate(spec.kv_cache_config.kv_cache_groups):
-            # currently treat all groups as full attention
-            attention_groups.append(idx)
+        full_attention_groups: list[int] = []
+        sliding_window_groups: list[int] = []
+        for group_config in RequestOffloadState.KV_GROUP_CONFIGS:
+            if group_config.sliding_window_size_in_blocks is None:
+                full_attention_groups.append(group_config.group_idx)
+            else:
+                sliding_window_groups.append(group_config.group_idx)
 
-        self.lookup_groups = attention_groups
+        # sort sliding window groups by window size in decreasing order
+        def _sliding_window_sort_key(i: int) -> int:
+            val = RequestOffloadState.KV_GROUP_CONFIGS[i].sliding_window_size_in_blocks
+            assert val is not None
+            return val
+
+        sliding_window_groups.sort(key=_sliding_window_sort_key, reverse=True)
+
+        # used by _lookup
+        self.full_attention_groups: tuple[int, ...] = tuple(full_attention_groups)
+        self.sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
+        self.lookup_groups = self.full_attention_groups + self.sliding_window_groups
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         # requests to load for the current scheduler step
@@ -176,6 +226,149 @@ class OffloadingConnectorScheduler:
                     return idx + sliding_window_size if not defer_lookup else None
         return consecutive_hits if not defer_lookup else None
 
+    def _touch(self, req_status: RequestOffloadState):
+        for group_config, group_state in zip(
+            RequestOffloadState.KV_GROUP_CONFIGS,
+            req_status.group_states,
+        ):
+            if group_config.sliding_window_size_in_blocks is None:
+                self.manager.touch(group_state.offload_keys)
+            else:
+                # we aim to keep just blocks that are necessary to hit
+                # the original request (+ decoded blocks)
+                blocks_to_skip = max(
+                    0,
+                    group_state.num_hit_blocks
+                    - group_config.sliding_window_size_in_blocks,
+                )
+                self.manager.touch(group_state.offload_keys[blocks_to_skip:])
+
+    def _lookup(self, req_status: RequestOffloadState) -> int | None:
+        num_computed_tokens = req_status.num_locally_computed_tokens
+        max_hit_size_tokens: int = req_status.req.num_tokens
+        if self.sliding_window_groups:
+            # the last prompt token has to be recomputed to get the logprobs
+            # for sliding window attention, we must reduce by 1 to make sure
+            # we still have a hit after reduction
+            max_hit_size_tokens -= 1
+        num_hit_tokens: int = 0
+        defer_lookup = False
+        # start by looking up all groups (full attention first, then sliding window)
+        lookup_groups = self.lookup_groups
+        while lookup_groups:
+            looked_up_sliding_window: bool = False
+            groups_iter = iter(lookup_groups)
+            lookup_groups = ()
+            for group_idx in groups_iter:
+                group_config: GroupOffloadSpec = RequestOffloadState.KV_GROUP_CONFIGS[
+                    group_idx
+                ]
+                group_state: RequestGroupState = req_status.group_states[group_idx]
+                offloaded_block_size = group_config.offloaded_block_size
+                offload_keys = group_state.offload_keys
+
+                assert (
+                    len(offload_keys)
+                    >= req_status.req.num_tokens // offloaded_block_size
+                )
+
+                max_hit_size_tokens = min(
+                    max_hit_size_tokens, len(offload_keys) * offloaded_block_size
+                )
+                if max_hit_size_tokens - num_computed_tokens < offloaded_block_size:
+                    # we can only load less than a block, better skip
+                    return 0
+
+                num_blocks = min(
+                    cdiv(max_hit_size_tokens, offloaded_block_size), len(offload_keys)
+                )
+                start_block_idx = num_computed_tokens // offloaded_block_size
+                offload_keys = offload_keys[start_block_idx:num_blocks]
+                sliding_window_size_in_blocks = (
+                    group_config.sliding_window_size_in_blocks
+                )
+
+                block_hits: int | None
+                if sliding_window_size_in_blocks is None:
+                    # full attention
+                    block_hits = self._maximal_prefix_lookup(offload_keys)
+                else:
+                    # sliding window
+                    block_hits = self._sliding_window_lookup(
+                        offload_keys, sliding_window_size_in_blocks
+                    )
+                if block_hits == 0:
+                    return 0
+
+                if block_hits is None:
+                    defer_lookup = True
+                else:
+                    max_hit_size_tokens = min(
+                        max_hit_size_tokens,
+                        offloaded_block_size * (start_block_idx + block_hits),
+                    )
+
+                new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+                if new_num_hit_tokens < offloaded_block_size:
+                    # we can only load less than a block, better skip
+                    return 0
+
+                if new_num_hit_tokens < num_hit_tokens:
+                    if defer_lookup:
+                        # make another iteration on all groups to check
+                        # if we still need to defer lookup
+                        defer_lookup = False
+                        lookup_groups = self.lookup_groups
+                    elif looked_up_sliding_window and not lookup_groups:
+                        # we need another iteration to confirm previously looked up
+                        # sliding window works with the new_num_hit_tokens
+                        lookup_groups = self.sliding_window_groups
+
+                looked_up_sliding_window |= sliding_window_size_in_blocks is not None
+                num_hit_tokens = new_num_hit_tokens
+
+        if defer_lookup:
+            logger.debug(
+                "Offloading manager delayed request %s",
+                req_status.req.request_id,
+            )
+            return None
+
+        # possibly delay request if any of the hit blocks is already being loaded
+        if self._blocks_being_loaded:
+            for group_config, group_state in zip(
+                RequestOffloadState.KV_GROUP_CONFIGS, req_status.group_states
+            ):
+                offloaded_block_size = group_config.offloaded_block_size
+                sliding_window_size_in_blocks = (
+                    group_config.sliding_window_size_in_blocks
+                )
+                offload_keys = group_state.offload_keys
+                num_blocks = cdiv(
+                    num_computed_tokens + num_hit_tokens, offloaded_block_size
+                )
+                start_block_idx = num_computed_tokens // offloaded_block_size
+                offload_keys = offload_keys[start_block_idx:num_blocks]
+                if sliding_window_size_in_blocks is not None:
+                    offload_keys = offload_keys[-sliding_window_size_in_blocks:]
+                if any(key in self._blocks_being_loaded for key in offload_keys):
+                    # hit blocks are being loaded, delay request
+                    logger.debug(
+                        "Delaying request %s since some of its"
+                        " blocks are already being loaded",
+                        req_status.req.request_id,
+                    )
+                    return None
+
+        logger.debug(
+            "Request %s hit %s offloaded tokens after %s GPU hit tokens",
+            req_status.req.request_id,
+            num_hit_tokens,
+            num_computed_tokens,
+        )
+
+        return num_hit_tokens
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -199,92 +392,28 @@ class OffloadingConnectorScheduler:
                   (between scheduler steps).
         """
         req_status = self._req_status.get(request.request_id)
+        is_new_request = True
         if req_status is None:
             req_status = RequestOffloadState(request)
             req_status.update_offload_keys()
             self._req_status[request.request_id] = req_status
         else:
+            is_new_request = False
             # make sure block IDs are cleared
             for gs in req_status.group_states:
                 gs.block_ids.clear()
         assert req_status is not None
         req_status.num_locally_computed_tokens = num_computed_tokens
 
-        for gs in req_status.group_states:
-            self.manager.touch(gs.offload_keys)
-
-        max_hit_size_tokens: int = req_status.req.num_tokens
-        num_hit_tokens: int = 0
-        defer_lookup = False
-        delay_request = False
-        for group_idx in self.lookup_groups:
-            group_config: GroupOffloadSpec = RequestOffloadState.KV_GROUP_CONFIGS[
-                group_idx
-            ]
-            group_state: RequestGroupState = req_status.group_states[group_idx]
-            offloaded_block_size = group_config.offloaded_block_size
-            offload_keys = group_state.offload_keys
-
-            num_blocks = max_hit_size_tokens // offloaded_block_size
-            assert len(offload_keys) >= num_blocks
-
-            max_hit_size_tokens = num_blocks * offloaded_block_size
-            num_hit_tokens = max_hit_size_tokens - num_computed_tokens
-            if num_hit_tokens < offloaded_block_size:
-                # we can only load less than a block, better skip
-                return 0, False
-
-            start_block_idx = num_computed_tokens // offloaded_block_size
-            offload_keys = offload_keys[start_block_idx:num_blocks]
-            block_hits = self._maximal_prefix_lookup(offload_keys)
-            if block_hits == 0:
-                return 0, False
-
-            if block_hits is None:
-                defer_lookup = True
-            else:
-                max_hit_size_tokens = offloaded_block_size * (
-                    start_block_idx + block_hits
-                )
-
-            num_hit_tokens = max_hit_size_tokens - num_computed_tokens
-            if num_hit_tokens < offloaded_block_size:
-                # we can only load less than a block, better skip
-                return 0, False
-
-            if (
-                block_hits
-                and self._blocks_being_loaded
-                and any(
-                    key in self._blocks_being_loaded
-                    for key in offload_keys[:block_hits]
-                )
-            ):
-                # hit blocks are being loaded, delay request
-                delay_request = True
-
-        if defer_lookup:
-            logger.debug(
-                "Offloading manager delayed request %s",
-                req_status.req.request_id,
+        num_hit_tokens = self._lookup(req_status)
+        if is_new_request:
+            req_status.update_num_hit_blocks(
+                num_computed_tokens + (num_hit_tokens or 0)
             )
-            return None, False
 
-        if delay_request:
-            logger.debug(
-                "Delaying request %s since some of its blocks are already being loaded",
-                req_status.req.request_id,
-            )
-            return None, False
+        self._touch(req_status)
 
-        logger.debug(
-            "Request %s hit %s offloaded tokens after %s GPU hit tokens",
-            request.request_id,
-            num_hit_tokens,
-            num_computed_tokens,
-        )
-
-        return num_hit_tokens, True
+        return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -327,7 +456,16 @@ class OffloadingConnectorScheduler:
             )
             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
 
-            start_block_idx = num_locally_computed_tokens // offloaded_block_size
+            if group_config.sliding_window_size_in_blocks is not None:
+                assert (
+                    num_pending_gpu_blocks
+                    <= group_config.sliding_window_size_in_blocks
+                    * RequestOffloadState.BLOCK_SIZE_FACTOR
+                )
+
+            start_block_idx = (
+                num_locally_computed_gpu_blocks // RequestOffloadState.BLOCK_SIZE_FACTOR
+            )
             num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
             assert len(offload_keys) >= num_blocks
             keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
@@ -407,8 +545,7 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            for group_state in req_status.group_states:
-                self.manager.touch(group_state.offload_keys)
+            self._touch(req_status)
 
             keys_to_store = set(store_output.keys_to_store)
 
@@ -417,6 +554,9 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 RequestOffloadState.KV_GROUP_CONFIGS, req_status.group_states
             ):
+                is_sliding_window = (
+                    group_config.sliding_window_size_in_blocks is not None
+                )
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
                 start_block_idx = group_state.next_stored_block_idx
                 block_ids = group_state.block_ids
@@ -434,6 +574,10 @@ class OffloadingConnectorScheduler:
                         block_id = block_ids[gpu_block_idx + i]
                         assert block_id != 0
                         src_block_ids.append(block_id)
+                        if is_sliding_window:
+                            # TODO (orozery):
+                            #  protect sliding window blocks from GPU eviction
+                            pass
                 group_sizes.append(num_group_blocks)
                 group_state.next_stored_block_idx = num_blocks
 
@@ -495,7 +639,6 @@ class OffloadingConnectorScheduler:
     def request_finished(
         self,
         request: Request,
-        block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Called when a request has finished, before its blocks are freed.

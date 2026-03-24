@@ -157,9 +157,15 @@ class MockOffloadingSpec(OffloadingSpec):
         return specs
 
 
+@dataclass(frozen=True)
+class GPUBlock:
+    group_idx: int
+    request_block_offset: int
+
+
 @dataclass
 class TransferSummary:
-    gpu_block_indices: list[int]
+    gpu_blocks: list[GPUBlock]
     offload_addresses: list[Any]
 
 
@@ -257,15 +263,15 @@ class RequestRunner:
         assert isinstance(offloading_spec, MockOffloadingSpec)
         self.offloading_spec: MockOffloadingSpec = offloading_spec
 
-        # mapping (offloading address) -> gpu_block_index
-        self.offloaded: dict[Any, int] = {}
+        # mapping (offloading address) -> GPUBlock
+        self.offloaded: dict[Any, GPUBlock] = {}
 
         self.completed_loads: list[TransferSummary] = []
         self.completed_stores: list[TransferSummary] = []
-        self.flushed_gpu_block_indexes: set[int] = set()
+        self.flushed_gpu_blocks: set[GPUBlock] = set()
 
-        # maps {block_id: block_offset}
-        self.gpu_block_index: dict[int, int] = {}
+        # block_id -> GPUBlock
+        self.gpu_blocks: dict[int, GPUBlock] = {}
 
         init_none_hash(sha256)
         self._block_hasher = get_request_block_hasher(gpu_block_size, sha256)
@@ -298,9 +304,7 @@ class RequestRunner:
             assert isinstance(src_spec, GPULoadStoreSpec)
 
             for block_id in src_spec.block_ids:
-                self.flushed_gpu_block_indexes.add(
-                    self.gpu_block_index[block_id.item()]
-                )
+                self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
 
         block_size_factor = self.offloaded_block_size // self.gpu_block_size
 
@@ -318,10 +322,11 @@ class RequestRunner:
 
             assert isinstance(offload_spec, MockLoadStoreSpec)
             assert isinstance(gpu_spec, GPULoadStoreSpec)
+            assert len(gpu_spec.group_sizes) == self.num_kv_groups
 
-            gpu_block_indices: list[int] = []
+            gpu_blocks: list[GPUBlock] = []
             for block_id in gpu_spec.block_ids:
-                gpu_block_indices.append(self.gpu_block_index[block_id.item()])
+                gpu_blocks.append(self.gpu_blocks[block_id.item()])
 
             # list of (offload_key, sub_block_offset)
             offload_addresses: list[Any] = []
@@ -330,29 +335,54 @@ class RequestRunner:
                     offload_addresses.append((offload_key, sub_block_idx))
 
             if store:
-                assert len(gpu_block_indices) == len(offload_addresses)
+                assert len(gpu_blocks) == len(offload_addresses)
+                assert gpu_spec.block_indices is None
 
                 self.completed_stores.append(
-                    TransferSummary(gpu_block_indices, offload_addresses)
+                    TransferSummary(gpu_blocks, offload_addresses)
                 )
             else:
-                remainder_sub_block_count = len(offload_addresses) - len(
-                    gpu_block_indices
-                )
-                assert remainder_sub_block_count >= 0
-                assert remainder_sub_block_count < block_size_factor
-                offload_addresses = offload_addresses[remainder_sub_block_count:]
+                assert gpu_spec.block_indices is not None
+                assert len(gpu_spec.block_indices) == self.num_kv_groups
+
+                gpu_block_offset = 0
+                offload_address_offset = 0
+                for group_size, logical_offset in zip(
+                    gpu_spec.group_sizes, gpu_spec.block_indices
+                ):
+                    gpu_block_end_offset = gpu_block_offset + group_size
+                    assert gpu_block_end_offset <= len(gpu_blocks)
+
+                    offload_addresses_to_skip = -logical_offset % block_size_factor
+                    offload_addresses_end_offset = (
+                        offload_address_offset + offload_addresses_to_skip + group_size
+                    )
+                    assert offload_addresses_end_offset <= len(offload_addresses)
+
+                    offload_addresses = (
+                        offload_addresses[:offload_address_offset]
+                        + offload_addresses[
+                            offload_address_offset + offload_addresses_to_skip :
+                        ]
+                    )
+
+                    gpu_block_offset += group_size
+                    offload_address_offset += group_size
+
+                assert gpu_block_offset == len(gpu_blocks)
+                assert offload_address_offset == len(offload_addresses)
 
                 self.completed_loads.append(
-                    TransferSummary(gpu_block_indices, offload_addresses)
+                    TransferSummary(gpu_blocks, offload_addresses)
                 )
 
-    def _update_gpu_block_idx(self):
-        for blocks in self.scheduler.kv_cache_manager.coordinator.single_type_managers[
-            0
-        ].req_to_blocks.values():
-            for block_idx, block in enumerate(blocks):
-                self.gpu_block_index[block.block_id] = block_idx
+    def _update_gpu_blocks(self):
+        for group_idx, manager in enumerate(
+            self.scheduler.kv_cache_manager.coordinator.single_type_managers
+        ):
+            for blocks in manager.req_to_blocks.values():
+                for block_idx, block in enumerate(blocks):
+                    self.gpu_blocks[block.block_id] = GPUBlock(group_idx, block_idx)
 
     def _run(self, decoded_tokens: list[int], complete_transfers: bool):
         """
@@ -372,7 +402,7 @@ class RequestRunner:
             assert self.scheduler.requests
 
             scheduler_output = self.scheduler.schedule()
-            self._update_gpu_block_idx()
+            self._update_gpu_blocks()
 
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
@@ -455,13 +485,30 @@ class RequestRunner:
 
                 self.scheduler.update_from_output(scheduler_output, model_runner_output)
 
+    def _to_gpu_blocks(
+        self, blocks: tuple[int | tuple[int, int], ...]
+    ) -> list[GPUBlock]:
+        gpu_blocks: list[GPUBlock] = []
+        for block in blocks:
+            if isinstance(block, int):
+                for group_idx in range(self.num_kv_groups):
+                    gpu_blocks.append(
+                        GPUBlock(group_idx=group_idx, request_block_offset=block)
+                    )
+            else:
+                group_idx, offset = block
+                gpu_blocks.append(
+                    GPUBlock(group_idx=group_idx, request_block_offset=offset)
+                )
+        return gpu_blocks
+
     def run(
         self,
         decoded_tokens: list[int],
         complete_transfers: bool = True,
-        expected_stored_gpu_block_indexes: tuple[int, ...] = (),
-        expected_loaded_gpu_block_indexes: tuple[int, ...] = (),
-        expected_flushed_gpu_block_indexes: tuple[int, ...] = (),
+        expected_stored: tuple[int | tuple[int, int], ...] = (),
+        expected_loaded: tuple[int | tuple[int, int], ...] = (),
+        expected_flushed: tuple[int | tuple[int, int], ...] = (),
     ):
         """
         Runs multiple engine (scheduler + worker) steps.
@@ -470,41 +517,49 @@ class RequestRunner:
         Args:
             decoded_tokens: the tokens to yield at each step.
             complete_transfers: complete transfers immediately
-            expected_stored_gpu_block_indexes: GPU block indexes
+            expected_stored: GPU blocks
                 that are expected to be written during the run.
-            expected_loaded_gpu_block_indexes: GPU block indexes
+            expected_loaded: GPU blocks
                 that are expected to be loaded during the run.
-            expected_flushed_gpu_block_indexes: GPU block indexes
+            expected_flushed: GPU blocks
                 that are expected to be flushed during the run.
+
+            A GPU block is either a (group_idx: int, request_block_offset: int)
+            or just request_block_offset: int.
+            The latter case is a convenience for representing all groups.
         """
+
+        expected_stored_gpu_blocks = self._to_gpu_blocks(expected_stored)
+        expected_loaded_gpu_blocks = self._to_gpu_blocks(expected_loaded)
+        expected_flushed_gpu_blocks = self._to_gpu_blocks(expected_flushed)
 
         self.manager.reset_mock()
         self._run(decoded_tokens, complete_transfers)
 
-        loaded_gpu_block_indexes: set[int] = set()
+        loaded_gpu_blocks: set[GPUBlock] = set()
         for transfer in self.completed_loads:
-            for gpu_block_idx, offloaded_address in zip(
-                transfer.gpu_block_indices, transfer.offload_addresses
+            for gpu_block, offloaded_address in zip(
+                transfer.gpu_blocks, transfer.offload_addresses
             ):
-                loaded_gpu_block_indexes.add(gpu_block_idx)
-                assert gpu_block_idx == self.offloaded[offloaded_address]
+                loaded_gpu_blocks.add(gpu_block)
+                assert gpu_block == self.offloaded[offloaded_address]
 
-        assert set(expected_loaded_gpu_block_indexes) == loaded_gpu_block_indexes
+        assert set(expected_loaded_gpu_blocks) == loaded_gpu_blocks
         self.completed_loads.clear()
 
-        stored_gpu_block_indexes: set[int] = set()
+        stored_gpu_blocks: set[GPUBlock] = set()
         for transfer in self.completed_stores:
-            for gpu_block_idx, offloaded_address in zip(
-                transfer.gpu_block_indices, transfer.offload_addresses
+            for gpu_block, offloaded_address in zip(
+                transfer.gpu_blocks, transfer.offload_addresses
             ):
-                stored_gpu_block_indexes.add(gpu_block_idx)
-                self.offloaded[offloaded_address] = gpu_block_idx
+                stored_gpu_blocks.add(gpu_block)
+                self.offloaded[offloaded_address] = gpu_block
 
-        assert set(expected_stored_gpu_block_indexes) == stored_gpu_block_indexes
+        assert set(expected_stored_gpu_blocks) == stored_gpu_blocks
         self.completed_stores.clear()
 
-        assert set(expected_flushed_gpu_block_indexes) == self.flushed_gpu_block_indexes
-        self.flushed_gpu_block_indexes.clear()
+        assert set(expected_flushed_gpu_blocks) == self.flushed_gpu_blocks
+        self.flushed_gpu_blocks.clear()
 
 
 @pytest.fixture
@@ -560,9 +615,9 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     # add block missing 1 token -> no offload
     runner.run(
         decoded_tokens=[0] * (offloaded_block_size - 1),
-        expected_stored_gpu_block_indexes=(3, 4, 5),
+        expected_stored=(3, 4, 5),
     )
-    runner.manager.prepare_store.assert_not_called()
+    runner.manager.touch.assert_not_called()
 
     # +1 token -> single block, fail prepare_store
     runner.manager.prepare_store.side_effect = lambda keys: None
@@ -579,7 +634,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[0] * (offloaded_block_size + 1),
-        expected_stored_gpu_block_indexes=(15, 16, 17),
+        expected_stored=(15, 16, 17),
     )
     runner.manager.touch.assert_called()
     block_hashes1 = list(runner.manager.touch.call_args.args[0])
@@ -602,7 +657,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     # terminate request
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=tuple(range(6 * block_size_factor)),
+        expected_stored=tuple(range(6 * block_size_factor)),
     )
 
     # full_block_tokens - num_computed_tokens < offloaded_block_size
@@ -624,9 +679,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     runner.new_request(token_ids=[0] * offloaded_block_size)
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output([])
     runner.connector_scheduler._maximal_prefix_lookup = lambda key: 1
-    runner.run(
-        decoded_tokens=[EOS_TOKEN_ID], expected_loaded_gpu_block_indexes=(0, 1, 2)
-    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
 
     # single block lookup with a hit in a middle block
     runner.new_request(
@@ -634,9 +687,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     )
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output([])
     runner.connector_scheduler._maximal_prefix_lookup = lambda key: 1
-    runner.run(
-        decoded_tokens=[EOS_TOKEN_ID], expected_loaded_gpu_block_indexes=(3, 4, 5)
-    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(3, 4, 5))
 
     # test take_events
     def to_keys(int_ids: list[int]) -> list[OffloadKey]:
@@ -710,8 +761,8 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
-        expected_flushed_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
-        expected_stored_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_flushed=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_stored=(0, 1, 2, 3, 4, 5, 6, 7, 8),
     )
 
     # restore KV cache space and reset GPU prefix cache
@@ -724,12 +775,12 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[0] * gpu_block_size,
-        expected_loaded_gpu_block_indexes=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
     )
 
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=(9, 10, 11),
+        expected_stored=(9, 10, 11),
     )
 
 
@@ -751,7 +802,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=(0, 1, 2),
+        expected_stored=(0, 1, 2),
     )
 
     # start a request to load the first block, but don't complete
@@ -782,7 +833,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output([])
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_loaded_gpu_block_indexes=(0, 1, 2),
+        expected_loaded=(0, 1, 2),
     )
 
     # second request will use the GPU prefix cache
@@ -807,7 +858,7 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
     runner.manager.prepare_store.side_effect = lambda keys: generate_store_output(keys)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        expected_stored_gpu_block_indexes=(0, 1, 2),
+        expected_stored=(0, 1, 2),
     )
 
     # start a request to load the first block, but don't complete
@@ -833,7 +884,7 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
     # complete loading request
     runner.run(
         decoded_tokens=[],
-        expected_loaded_gpu_block_indexes=(0, 1, 2),
+        expected_loaded=(0, 1, 2),
     )
 
     # assert request is deleted
