@@ -4,7 +4,7 @@ import copy
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -164,37 +164,46 @@ class TransferSummary:
 class RequestRunner:
     def __init__(
         self,
-        offloaded_block_size: int,
-        gpu_block_size: int,
+        block_size: int,
         num_gpu_blocks: int,
+        block_size_factor: int = 1,
         async_scheduling: bool = True,
+        kv_cache_groups: list[KVCacheGroupSpec] | None = None,
     ):
-        self.offloaded_block_size: int = offloaded_block_size
-        self.gpu_block_size: int = gpu_block_size
+        assert block_size_factor == 1 or kv_cache_groups is None, (
+            "block_size_factor > 1 requires all groups to have the same "
+            "block size, so kv_cache_groups must be None (use default group)"
+        )
+
+        self.block_size_factor: int = block_size_factor
+        self.block_size: int = block_size
         self.num_gpu_blocks: int = num_gpu_blocks
         self.async_scheduling: bool = async_scheduling
 
         self.req_id: int = -1
 
         vllm_config = create_vllm_config(
-            block_size=gpu_block_size, max_num_batched_tokens=1000
+            block_size=block_size,
+            max_num_batched_tokens=1000,
+            disable_hybrid_kv_cache_manager=False,
         )
         vllm_config.scheduler_config.async_scheduling = async_scheduling
+
+        extra_config: dict[str, Any] = {
+            "spec_name": "MockOffloadingSpec",
+            "spec_module_path": "tests.v1.kv_connector.unit.offloading_connector.utils",  # noqa: E501
+        }
+        if block_size_factor > 1:
+            extra_config["block_size"] = block_size * block_size_factor
+
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector="OffloadingConnector",
             kv_role="kv_both",
-            kv_connector_extra_config={
-                "spec_name": "MockOffloadingSpec",
-                "spec_module_path": "tests.v1.kv_connector.unit.offloading_connector.utils",  # noqa: E501
-                "block_size": offloaded_block_size,
-            },
+            kv_connector_extra_config=extra_config,
         )
 
-        block_size = vllm_config.cache_config.block_size
-        kv_cache_config = KVCacheConfig(
-            num_blocks=num_gpu_blocks,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
+        if kv_cache_groups is None:
+            kv_cache_groups = [
                 KVCacheGroupSpec(
                     ["layer"],
                     FullAttentionSpec(
@@ -204,7 +213,12 @@ class RequestRunner:
                         dtype=torch.float32,
                     ),
                 )
-            ],
+            ]
+
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_gpu_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
         )
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         self.num_kv_groups = len(kv_cache_config.kv_cache_groups)
@@ -224,11 +238,38 @@ class RequestRunner:
 
         # register worker kv_caches to enable OffloadingWorker creations
         # set_current_vllm_config is needed for get_kv_cache_layout() to work
-        with set_current_vllm_config(vllm_config):
-            self.worker_connector.register_cross_layers_kv_cache(
-                kv_cache=torch.empty(0),
-                attn_backend=FlashAttentionBackend,
-            )
+        # Mock get_layers_from_vllm_config so that mock layer names
+        # resolve to layers whose get_attn_backend() returns
+        # FlashAttentionBackend.
+        def _mock_get_layers(_vllm_config, _layer_type, layer_names):
+            mock_layer = MagicMock()
+            mock_layer.get_attn_backend.return_value = FlashAttentionBackend
+            return {name: mock_layer for name in layer_names}
+
+        kv_caches: dict[str, torch.Tensor] = {}
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                # Shape follows FlashAttention layout:
+                # (2, num_blocks, block_size, num_kv_heads, head_size)
+                kv_caches[layer_name] = torch.empty(
+                    2,
+                    0,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    dtype=spec.dtype,
+                )
+
+        with (
+            set_current_vllm_config(vllm_config),
+            patch(
+                "vllm.distributed.kv_transfer.kv_connector.v1"
+                ".offloading.worker.get_layers_from_vllm_config",
+                side_effect=_mock_get_layers,
+            ),
+        ):
+            self.worker_connector.register_kv_caches(kv_caches)
 
         # extract connector of scheduler
         scheduler_connector = self.scheduler.connector
@@ -243,12 +284,16 @@ class RequestRunner:
         assert isinstance(manager, MagicMock)
         self.manager: MagicMock = manager
 
-        assert len(RequestOffloadState.KV_GROUP_CONFIGS) == 1
-        assert RequestOffloadState.KV_GROUP_CONFIGS[0].gpu_block_size == gpu_block_size
-        assert (
-            RequestOffloadState.KV_GROUP_CONFIGS[0].offloaded_block_size
-            == offloaded_block_size
-        )
+        num_kv_groups = len(kv_cache_config.kv_cache_groups)
+        assert len(RequestOffloadState.KV_GROUP_CONFIGS) == num_kv_groups
+        for group_config, kv_cache_group in zip(
+            RequestOffloadState.KV_GROUP_CONFIGS, kv_cache_config.kv_cache_groups
+        ):
+            gpu_block_size = kv_cache_group.kv_cache_spec.block_size
+            assert group_config.gpu_block_size == gpu_block_size
+            assert (
+                group_config.offloaded_block_size == gpu_block_size * block_size_factor
+            )
 
         # extract OffloadingSpec of worker_connector
         connector_worker = self.worker_connector.connector_worker
@@ -268,7 +313,7 @@ class RequestRunner:
         self.gpu_blocks: dict[int, GPUBlock] = {}
 
         init_none_hash(sha256)
-        self._block_hasher = get_request_block_hasher(gpu_block_size, sha256)
+        self._block_hasher = get_request_block_hasher(block_size, sha256)
 
         self._dummy_ctx: ForwardContext = ForwardContext(
             no_compile_layers={},
@@ -300,7 +345,7 @@ class RequestRunner:
             for block_id in src_spec.block_ids:
                 self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
 
-        block_size_factor = self.offloaded_block_size // self.gpu_block_size
+        block_size_factor = self.block_size_factor
 
         for transfer_spec in self.offloading_spec.get_completed_transfers():
             src_spec, dst_spec = transfer_spec
@@ -561,13 +606,18 @@ def request_runner():
     runners = []
 
     def runner_factory(
-        offloaded_block_size, gpu_block_size, num_gpu_blocks, async_scheduling
+        block_size,
+        num_gpu_blocks,
+        async_scheduling,
+        block_size_factor=1,
+        kv_cache_groups=None,
     ):
         runner = RequestRunner(
-            offloaded_block_size=offloaded_block_size,
-            gpu_block_size=gpu_block_size,
+            block_size=block_size,
             num_gpu_blocks=num_gpu_blocks,
+            block_size_factor=block_size_factor,
             async_scheduling=async_scheduling,
+            kv_cache_groups=kv_cache_groups,
         )
         runners.append(runner)
         return runner
