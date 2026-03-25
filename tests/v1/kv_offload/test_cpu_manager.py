@@ -62,7 +62,6 @@ def verify_load_output(
 
 def verify_events(
     events: Iterable[OffloadingEvent],
-    block_size: int,
     expected_stores: tuple[set[int], ...] = (),
     expected_evictions: tuple[set[int], ...] = (),
 ):
@@ -70,7 +69,6 @@ def verify_events(
     evictions: list[set[OffloadKey]] = []
     for event in events:
         assert event.medium == CPULoadStoreSpec.medium()
-        assert event.block_size == block_size
         if event.removed:
             evictions.append(set(event.keys))
         else:
@@ -101,9 +99,7 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
               candidate to make room for [3, 4, 5]
         - After complete_store([2, 3, 4, 5]), block 2 must still be present.
     """
-    block_size = 256
     manager = CPUOffloadingManager(
-        block_size=block_size,
         num_blocks=4,
         cache_policy=eviction_policy,
         enable_events=True,
@@ -142,9 +138,8 @@ def test_cpu_manager():
     Tests CPUOffloadingManager with lru policy.
     """
     # initialize a CPU backend with a capacity of 4 blocks
-    block_size = 256
     cpu_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="lru", enable_events=True
+        num_blocks=4, cache_policy="lru", enable_events=True
     )
 
     # prepare store [1, 2]
@@ -167,9 +162,7 @@ def test_cpu_manager():
 
     # complete store [1, 2]
     cpu_manager.complete_store(to_keys([1, 2]))
-    verify_events(
-        cpu_manager.take_events(), block_size=block_size, expected_stores=({1, 2},)
-    )
+    verify_events(cpu_manager.take_events(), expected_stores=({1, 2},))
 
     # lookup [1, 2]
     assert cpu_manager.lookup(to_key(1)) is True
@@ -188,9 +181,7 @@ def test_cpu_manager():
     )
 
     # verify eviction event
-    verify_events(
-        cpu_manager.take_events(), block_size=block_size, expected_evictions=({1},)
-    )
+    verify_events(cpu_manager.take_events(), expected_evictions=({1},))
 
     # prepare store with no space
     assert cpu_manager.prepare_store(to_keys([1, 6])) is None
@@ -253,7 +244,6 @@ def test_cpu_manager():
 
     verify_events(
         cpu_manager.take_events(),
-        block_size=block_size,
         expected_stores=({3, 4, 5}, {6, 7, 8}),
         expected_evictions=({2, 3, 4}, {8}),
     )
@@ -264,9 +254,8 @@ def test_arc_manager_basic():
     Tests CPUOffloadingManager with arc policy.
     Verifies that ARC handles store, load, and lookup operations correctly.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=True
+        num_blocks=4, cache_policy="arc", enable_events=True
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -291,9 +280,7 @@ def test_arc_manager_basic():
 
     # complete store [1, 2]
     arc_manager.complete_store(to_keys([1, 2]))
-    verify_events(
-        arc_manager.take_events(), block_size=block_size, expected_stores=({1, 2},)
-    )
+    verify_events(arc_manager.take_events(), expected_stores=({1, 2},))
 
     # lookup [1, 2]
     assert arc_manager.lookup(to_key(1)) is True
@@ -310,9 +297,8 @@ def test_arc_manager_t1_to_t2_promotion():
     Tests that accessing a block in T1 promotes it to T2 (frequent).
     This is a key feature of ARC's adaptive behavior.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=False
+        num_blocks=4, cache_policy="arc", enable_events=False
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -338,9 +324,8 @@ def test_arc_manager_eviction_with_load():
     Tests ARC eviction behavior similar to LRU test.
     Verifies that blocks being loaded (ref_cnt > 0) cannot be evicted.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=True
+        num_blocks=4, cache_policy="arc", enable_events=True
     )
 
     # prepare and complete store [1, 2, 3, 4]
@@ -380,9 +365,8 @@ def test_arc_manager_adaptive_target():
     When a block in B1 (ghost list) is accessed, target_t1_size increases.
     When a block in B2 is accessed, target_t1_size decreases.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=2, cache_policy="arc", enable_events=False
+        num_blocks=2, cache_policy="arc", enable_events=False
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -413,9 +397,8 @@ def test_arc_manager_t1_t2_eviction_policy():
     Tests that ARC evicts from T1 or T2 based on target_t1_size.
     If |T1| >= target_t1_size, evict from T1, otherwise from T2.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=False
+        num_blocks=4, cache_policy="arc", enable_events=False
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -453,9 +436,8 @@ def test_arc_manager_ghost_list_bounds():
     Tests that ghost lists (B1, B2) don't grow unbounded.
     They should be capped at cache_capacity.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=2, cache_policy="arc", enable_events=False
+        num_blocks=2, cache_policy="arc", enable_events=False
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -479,9 +461,8 @@ def test_arc_manager_touch_ordering():
     Tests that touch() correctly updates access patterns.
     Similar to LRU test but verifies T1/T2 ordering.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=True
+        num_blocks=4, cache_policy="arc", enable_events=True
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -518,9 +499,8 @@ def test_arc_manager_failed_store():
     Tests that failed store operations clean up correctly.
     Similar to LRU test but for ARC.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=True
+        num_blocks=4, cache_policy="arc", enable_events=True
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -553,9 +533,8 @@ def test_arc_manager_full_scenario():
     Comprehensive test covering multiple ARC operations in sequence.
     Similar to the full LRU test but adapted for ARC behavior.
     """
-    block_size = 256
     arc_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="arc", enable_events=True
+        num_blocks=4, cache_policy="arc", enable_events=True
     )
     arc_policy = arc_manager._policy
     assert isinstance(arc_policy, ARCCachePolicy)
@@ -595,9 +574,8 @@ def test_filter_reused_manager():
     """
     Tests FilterReusedOffloadingManager with a CPUOffloadingManager.
     """
-    block_size = 256
     lru_manager = CPUOffloadingManager(
-        block_size=block_size, num_blocks=4, cache_policy="lru", enable_events=True
+        num_blocks=4, cache_policy="lru", enable_events=True
     )
 
     from vllm.v1.kv_offload.reuse_manager import FilterReusedOffloadingManager

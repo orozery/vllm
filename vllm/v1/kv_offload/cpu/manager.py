@@ -33,12 +33,10 @@ class CPUOffloadingManager(OffloadingManager):
 
     def __init__(
         self,
-        block_size: int,
         num_blocks: int,
         cache_policy: Literal["lru", "arc"] = "lru",
         enable_events: bool = False,
     ):
-        self.block_size: int = block_size
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks
         self._num_allocated_blocks: int = 0
@@ -140,7 +138,6 @@ class CPUOffloadingManager(OffloadingManager):
             self.events.append(
                 OffloadingEvent(
                     keys=to_evict,
-                    block_size=self.block_size,
                     medium=self.medium,
                     removed=True,
                 )
@@ -183,7 +180,6 @@ class CPUOffloadingManager(OffloadingManager):
             self.events.append(
                 OffloadingEvent(
                     keys=stored_keys,
-                    block_size=self.block_size,
                     medium=self.medium,
                     removed=False,
                 )
