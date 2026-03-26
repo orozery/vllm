@@ -16,6 +16,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    CanonicalKVCaches,
+    KVCacheBlockDataRef,
+    KVCacheBlockTensor,
+    WorkerConnectorInitializationData,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
@@ -24,12 +30,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.kv_offload.spec import (
-    CanonicalKVCacheRef,
-    CanonicalKVCaches,
-    CanonicalKVCacheTensor,
-    OffloadingSpec,
-)
+from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingWorker,
     TransferSpec,
@@ -67,6 +68,13 @@ class OffloadingConnectorWorker:
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
         for src_cls, dst_cls, handler in self.spec.get_handlers(kv_caches):
             self.worker.register_handler(src_cls, dst_cls, handler)
+
+    def initialize_worker_connector(
+        self,
+        initialization_data: WorkerConnectorInitializationData,
+    ) -> None:
+        if initialization_data.canonical_kv_caches is not None:
+            self._register_handlers(initialization_data.canonical_kv_caches)
 
     def register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
@@ -201,8 +209,8 @@ class OffloadingConnectorWorker:
                 else:
                     raise NotImplementedError
 
-        block_tensors: list[CanonicalKVCacheTensor] = []
-        block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
+        block_tensors: list[KVCacheBlockTensor] = []
+        block_data_refs: dict[str, list[KVCacheBlockDataRef]] = defaultdict(list)
         for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
             tensor_layer_names = kv_cache_tensor.shared_by
 
@@ -220,7 +228,7 @@ class OffloadingConnectorWorker:
             first_layer_name = tensor_layer_names[0]
             for tensor in tensors_per_block[first_layer_name]:
                 block_tensors.append(
-                    CanonicalKVCacheTensor(
+                    KVCacheBlockTensor(
                         tensor=tensor,
                         page_size_bytes=page_size_bytes[first_layer_name],
                     )
@@ -229,15 +237,15 @@ class OffloadingConnectorWorker:
                 curr_tensor_idx = len(block_tensors) - 1
                 for layer_name in tensor_layer_names:
                     block_data_refs[layer_name].append(
-                        CanonicalKVCacheRef(
+                        KVCacheBlockDataRef(
                             tensor_idx=curr_tensor_idx,
                             page_size_bytes=(unpadded_page_size_bytes[layer_name]),
                         )
                     )
 
-        group_data_refs: list[list[CanonicalKVCacheRef]] = []
+        group_data_refs: list[list[KVCacheBlockDataRef]] = []
         for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
-            group_refs: list[CanonicalKVCacheRef] = []
+            group_refs: list[KVCacheBlockDataRef] = []
             for layer_name in kv_cache_group.layer_names:
                 group_refs += block_data_refs[layer_name]
             group_data_refs.append(group_refs)
@@ -283,11 +291,11 @@ class OffloadingConnectorWorker:
             .set_(storage)
             .view(num_blocks, page_size_bytes)
         )
-        kv_cache_tensor = CanonicalKVCacheTensor(
+        kv_cache_tensor = KVCacheBlockTensor(
             tensor=tensor, page_size_bytes=page_size_bytes
         )
         # in cross layers layout, there's currently only a single group
-        kv_cache_data_ref = CanonicalKVCacheRef(
+        kv_cache_data_ref = KVCacheBlockDataRef(
             tensor_idx=0, page_size_bytes=page_size_bytes
         )
         canonical_kv_caches = CanonicalKVCaches(

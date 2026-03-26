@@ -9,7 +9,8 @@ from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.reuse_manager import FilterReusedOffloadingManager
-from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
+from vllm.distributed.kv_transfer.kv_connector.v1.base import CanonicalKVCaches
+from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 

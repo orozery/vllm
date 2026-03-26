@@ -11,7 +11,10 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec, GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import CanonicalKVCacheRef, CanonicalKVCaches
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    CanonicalKVCaches,
+    KVCacheBlockDataRef,
+)
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
     TransferResult,
@@ -82,7 +85,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         gpu_tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
         block_size_factor: int,
-        kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
+        kv_cache_groups_data_refs: list[list[KVCacheBlockDataRef]],
         gpu_to_cpu: bool,
     ):
         """
@@ -94,7 +97,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             cpu_tensors: list of CPU KV cache tensors.
                 Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
                 Order should match gpu_tensors.
-            kv_cache_groups_data_refs: list of CanonicalKVCacheRef per group.
+            kv_cache_groups_data_refs: list of KVCacheBlockDataRef per group.
             gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
         """
         assert len(gpu_tensors) == len(cpu_tensors)
@@ -379,8 +382,11 @@ class CpuGpuOffloadingHandlers:
         cpu_tensors: list[torch.Tensor] = []
         for kv_cache_tensor in kv_caches.tensors:
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
-            gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
-                (-1, gpu_page_size_bytes)
+            gpu_tensor = kv_cache_tensor.tensor
+            assert gpu_tensor.dtype == torch.int8
+            assert gpu_tensor.shape == (
+                gpu_tensor.shape[0],
+                gpu_page_size_bytes,
             )
             cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
             cpu_tensor = torch.zeros(

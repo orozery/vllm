@@ -8,10 +8,10 @@ import torch
 
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import (
-    CanonicalKVCacheRef,
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CanonicalKVCaches,
-    CanonicalKVCacheTensor,
+    KVCacheBlockDataRef,
+    KVCacheBlockTensor,
 )
 from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
 
@@ -50,8 +50,8 @@ def test_transfer(
 ) -> None:
     set_random_seed(seed)
 
-    # build CanonicalKVCacheTensor list: one per tensor
-    kv_cache_tensors: list[CanonicalKVCacheTensor] = []
+    # build KVCacheBlockTensor list: one per tensor
+    kv_cache_tensors: list[KVCacheBlockTensor] = []
     for i in range(num_tensors):
         gpu_tensor = torch.zeros(
             (num_gpu_blocks, gpu_page_size_bytes),
@@ -59,16 +59,16 @@ def test_transfer(
             device=device,
         )
         kv_cache_tensors.append(
-            CanonicalKVCacheTensor(
+            KVCacheBlockTensor(
                 tensor=gpu_tensor,
                 page_size_bytes=gpu_page_size_bytes,
             )
         )
 
     # one group containing all tensors, one data ref per tensor
-    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]] = [
+    kv_cache_groups_data_refs: list[list[KVCacheBlockDataRef]] = [
         [
-            CanonicalKVCacheRef(
+            KVCacheBlockDataRef(
                 tensor_idx=i,
                 page_size_bytes=gpu_page_size_bytes,
             )
@@ -211,7 +211,7 @@ def test_transfer_multi_group(
     num_groups = 3
     tensors_per_group = 2
     num_tensors = num_groups * tensors_per_group
-    kv_cache_tensors: list[CanonicalKVCacheTensor] = []
+    kv_cache_tensors: list[KVCacheBlockTensor] = []
     for _ in range(num_tensors):
         gpu_tensor = torch.zeros(
             (num_gpu_blocks, gpu_page_size_bytes),
@@ -219,15 +219,15 @@ def test_transfer_multi_group(
             device=device,
         )
         kv_cache_tensors.append(
-            CanonicalKVCacheTensor(
+            KVCacheBlockTensor(
                 tensor=gpu_tensor,
                 page_size_bytes=gpu_page_size_bytes,
             )
         )
 
-    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]] = [
+    kv_cache_groups_data_refs: list[list[KVCacheBlockDataRef]] = [
         [
-            CanonicalKVCacheRef(
+            KVCacheBlockDataRef(
                 tensor_idx=g * tensors_per_group + i,
                 page_size_bytes=gpu_page_size_bytes,
             )

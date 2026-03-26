@@ -19,11 +19,11 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.kv_offload.spec import (
-    CanonicalKVCacheRef,
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CanonicalKVCaches,
-    OffloadingSpec,
+    KVCacheBlockDataRef,
 )
+from vllm.v1.kv_offload.spec import OffloadingSpec
 
 NUM_BLOCKS = 10
 BLOCK_SIZE = 16
@@ -310,7 +310,7 @@ def test_register_kv_caches(mock_get_layers, backend):
     ]
 
     # -- Expected group data refs (order matches kv_cache_groups) -------------
-    ref = CanonicalKVCacheRef
+    ref = KVCacheBlockDataRef
     expected_group_refs = [
         # attn group: layers attn[0..2] → tensors 0,1,2 with full page size
         [
@@ -474,16 +474,16 @@ def test_register_kv_caches_uniform_type(mock_get_layers, backend):
         assert canonical.tensors[2].tensor.shape == (NUM_BLOCKS, half_b)
         assert canonical.tensors[3].tensor.shape == (NUM_BLOCKS, half_b)
 
-        assert group_refs[0] == CanonicalKVCacheRef(
+        assert group_refs[0] == KVCacheBlockDataRef(
             tensor_idx=0, page_size_bytes=half_a
         )
-        assert group_refs[1] == CanonicalKVCacheRef(
+        assert group_refs[1] == KVCacheBlockDataRef(
             tensor_idx=1, page_size_bytes=half_a
         )
-        assert group_refs[2] == CanonicalKVCacheRef(
+        assert group_refs[2] == KVCacheBlockDataRef(
             tensor_idx=2, page_size_bytes=half_b
         )
-        assert group_refs[3] == CanonicalKVCacheRef(
+        assert group_refs[3] == KVCacheBlockDataRef(
             tensor_idx=3, page_size_bytes=half_b
         )
     else:
@@ -493,9 +493,9 @@ def test_register_kv_caches_uniform_type(mock_get_layers, backend):
         assert canonical.tensors[0].tensor.shape == (NUM_BLOCKS, spec_a.page_size_bytes)
         assert canonical.tensors[1].tensor.shape == (NUM_BLOCKS, spec_b.page_size_bytes)
 
-        assert group_refs[0] == CanonicalKVCacheRef(
+        assert group_refs[0] == KVCacheBlockDataRef(
             tensor_idx=0, page_size_bytes=spec_a.page_size_bytes
         )
-        assert group_refs[1] == CanonicalKVCacheRef(
+        assert group_refs[1] == KVCacheBlockDataRef(
             tensor_idx=1, page_size_bytes=spec_b.page_size_bytes
         )
