@@ -75,6 +75,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
+    def initialize_worker_connector(self, initialization_data):
+        if self.connector_worker is not None:
+            self.connector_worker.initialize_worker_connector(initialization_data)
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None
         assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)

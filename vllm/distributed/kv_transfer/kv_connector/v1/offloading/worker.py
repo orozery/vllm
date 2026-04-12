@@ -295,6 +295,43 @@ class OffloadingConnectorWorker:
 
         self._register_handlers(canonical_kv_caches)
 
+    def initialize_worker_connector(self, initialization_data):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            CanonicalKVCaches as BaseCanonicalKVCaches,
+        )
+
+        base_canonical = initialization_data.canonical_kv_caches
+        if not isinstance(base_canonical, BaseCanonicalKVCaches):
+            return
+
+        # Convert base.py CanonicalKVCaches to spec.py CanonicalKVCaches
+        spec_tensors = []
+        for bt in base_canonical.tensors:
+            spec_tensors.append(
+                CanonicalKVCacheTensor(
+                    tensor=bt.tensor,
+                    page_size_bytes=bt.page_size_bytes,
+                )
+            )
+
+        spec_refs = []
+        for group_refs in base_canonical.group_data_refs:
+            spec_group = []
+            for ref in group_refs:
+                spec_group.append(
+                    CanonicalKVCacheRef(
+                        tensor_idx=ref.tensor_idx,
+                        page_size_bytes=ref.page_size_bytes,
+                    )
+                )
+            spec_refs.append(spec_group)
+
+        canonical = CanonicalKVCaches(
+            tensors=spec_tensors,
+            group_data_refs=spec_refs,
+        )
+        self._register_handlers(canonical)
+
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
             success = self.worker.transfer_async(job_id, transfer_spec)
