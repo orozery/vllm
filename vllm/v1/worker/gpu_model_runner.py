@@ -4823,7 +4823,7 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
-        if not load_dummy_weights:
+        if not load_dummy_weights and self.load_config.load_format != "dummy":
             prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
@@ -6771,6 +6771,15 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+
+        # DEBUG: dump KV cache tensor layout
+        for layer_name, tensor in sorted(kv_caches.items()):
+            logger.info(
+                "KV cache %-60s shape=%-30s stride=%-30s dtype=%s device=%s",
+                layer_name, tensor.shape, tensor.stride(),
+                tensor.dtype, tensor.device,
+            )
+
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

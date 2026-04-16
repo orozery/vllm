@@ -341,6 +341,17 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if self.load_config.load_format == "dummy":
+            # Dummy weights are placeholders — skip profiling entirely
+            # and give all free GPU memory to KV cache.
+            free = torch.cuda.mem_get_info(self.device)[0]
+            logger.info(
+                "Dummy load format: skipping profile run, "
+                "reporting %s GiB free for KV cache.",
+                format_gib(free),
+            )
+            return free
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
