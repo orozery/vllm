@@ -84,8 +84,13 @@ class OffloadingSpec(ABC):
         self.extra_config = kv_transfer_config.kv_connector_extra_config
 
         # block size used by vLLM for hashing request tokens for the sake
-        # of enabling prefix caching
-        self.hash_block_size = vllm_config.cache_config.block_size
+        # of enabling prefix caching (DCP/PCP multiply the effective hash
+        # block size, matching the scheduler_block_size in core.py)
+        self.hash_block_size = (
+            vllm_config.cache_config.block_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
         # gpu block size per group
         self.gpu_block_size: tuple[int, ...] = tuple(
             kv_cache_group.kv_cache_spec.block_size
