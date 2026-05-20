@@ -1111,37 +1111,24 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
     assert kv_group_configs[1].sliding_window_size_in_blocks == 2
     assert kv_group_configs[1].offloaded_block_size == swa_block_size
 
-    # Send 32 tokens = 2 full-attn blocks = 8 SWA blocks.
-    # Then decode 1 token to trigger the store.
+    # Send 32 tokens = 2 full-attn blocks (block_size=16) = 8 SWA blocks
+    # (block_size=4). Decode 1 token to trigger the initial store.
     num_tokens = 32
     runner.new_request(token_ids=[0] * num_tokens)
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
-    runner.run(decoded_tokens=[0])
-
-    # Decode enough to actually trigger offloading (need +1 token beyond
-    # the last complete offloaded block boundary for each group).
-    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
-        generate_store_output(keys)
-    )
     runner.run(
-        decoded_tokens=[EOS_TOKEN_ID],
-        # Group 0 (full attn, block_size=16): 2 blocks, each maps to 4 GPU blocks
-        #   Block 0 -> GPU blocks (0, 0)..(0, 3), Block 1 -> GPU blocks (0, 4)..(0, 7)
-        # Group 1 (SWA, block_size=4): 8 blocks total, but only tail 2 per segment:
-        #   Segment 0 (SWA blocks 0-3): store only blocks 2, 3
-        #   Segment 1 (SWA blocks 4-7): store only blocks 6, 7
-        #   Each SWA block maps to 1 GPU block.
+        decoded_tokens=[0],
+        # Group 0 (full attn, block_size=16): 2 offloaded blocks
+        #   -> GPU blocks (0, 0) and (0, 1)
+        # Group 1 (SWA, block_size=4): 8 offloaded blocks, skip first 2
+        #   per segment of 4:
+        #   Segment 0 (blocks 0-3): skip 0,1 -> store (1, 2), (1, 3)
+        #   Segment 1 (blocks 4-7): skip 4,5 -> store (1, 6), (1, 7)
         expected_stored=(
             (0, 0),
             (0, 1),
-            (0, 2),
-            (0, 3),
-            (0, 4),
-            (0, 5),
-            (0, 6),
-            (0, 7),
             (1, 2),
             (1, 3),
             (1, 6),
@@ -1149,24 +1136,27 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
         ),
     )
 
+    # Finish the request.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
     # Verify that loads still work correctly for the stored SWA blocks.
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * num_tokens + [1])
     runner.manager.lookup.return_value = True
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 2
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        # Group 0: full prefix lookup -> loads all 8 GPU blocks (0..7)
+        # Group 0: full prefix lookup hits 2 offloaded blocks
+        #   -> loads GPU blocks (0, 0), (0, 1)
         # Group 1: sliding window lookup finds trailing 2 from last segment
         #   (blocks 6, 7 which were stored)
+        #   -> loads GPU blocks (1, 6), (1, 7)
         expected_loaded=(
             (0, 0),
             (0, 1),
-            (0, 2),
-            (0, 3),
-            (0, 4),
-            (0, 5),
-            (0, 6),
-            (0, 7),
             (1, 6),
             (1, 7),
         ),
