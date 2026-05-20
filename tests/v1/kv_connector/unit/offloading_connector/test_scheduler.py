@@ -1041,3 +1041,133 @@ def test_reset_cache(request_runner, async_scheduling: bool):
     for req_status in runner.connector_scheduler._req_status.values():
         for group_state in req_status.group_states:
             assert group_state.next_stored_block_idx == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_alignment_skip(request_runner, async_scheduling: bool):
+    """SWA blocks unreachable by the load path are skipped during store.
+
+    Simulates a DeepSeek V4-like hybrid architecture where SWA groups have
+    much smaller block sizes than the full-attention (MLA) group, causing
+    most SWA blocks to be unreachable by the alignment-based load path.
+
+    Setup:
+      - Group 0: full attention (MLA-like), block_size=16
+      - Group 1: SWA, block_size=4, sliding_window=8
+
+    alignment_block_count = 16 / 4 = 4 SWA blocks per alignment segment.
+    sliding_window_size_in_blocks = ceil(8 / 4) = 2.
+    Within each segment of 4 SWA blocks, only the trailing 2 are stored.
+
+    With 32 tokens (2 full-attn blocks, 8 SWA blocks):
+      - Group 0 stores: blocks 0, 1  (all full-attn blocks)
+      - Group 1 stores: blocks 2, 3, 6, 7  (skip 0,1,4,5)
+
+    For real DeepSeek V4 (100K tokens), this reduces SWA stores by ~78%.
+    """
+    full_attn_block_size = 16
+    swa_block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 200
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_attn_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    # Verify config: alignment_block_count computed correctly
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert len(kv_group_configs) == 2
+    # Group 0: full attention -> no alignment skip
+    assert kv_group_configs[0].alignment_block_count is None
+    assert kv_group_configs[0].sliding_window_size_in_blocks is None
+    assert kv_group_configs[0].offloaded_block_size == full_attn_block_size
+    # Group 1: SWA -> alignment_block_count = 16/4 = 4, tail = 2
+    assert kv_group_configs[1].alignment_block_count == 4
+    assert kv_group_configs[1].sliding_window_size_in_blocks == 2
+    assert kv_group_configs[1].offloaded_block_size == swa_block_size
+
+    # Send 32 tokens = 2 full-attn blocks = 8 SWA blocks.
+    # Then decode 1 token to trigger the store.
+    num_tokens = 32
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+
+    # Decode enough to actually trigger offloading (need +1 token beyond
+    # the last complete offloaded block boundary for each group).
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0 (full attn, block_size=16): 2 blocks, each maps to 4 GPU blocks
+        #   Block 0 -> GPU blocks (0, 0)..(0, 3), Block 1 -> GPU blocks (0, 4)..(0, 7)
+        # Group 1 (SWA, block_size=4): 8 blocks total, but only tail 2 per segment:
+        #   Segment 0 (SWA blocks 0-3): store only blocks 2, 3
+        #   Segment 1 (SWA blocks 4-7): store only blocks 6, 7
+        #   Each SWA block maps to 1 GPU block.
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 5),
+            (0, 6),
+            (0, 7),
+            (1, 2),
+            (1, 3),
+            (1, 6),
+            (1, 7),
+        ),
+    )
+
+    # Verify that loads still work correctly for the stored SWA blocks.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * num_tokens + [1])
+    runner.manager.lookup.return_value = True
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0: full prefix lookup -> loads all 8 GPU blocks (0..7)
+        # Group 1: sliding window lookup finds trailing 2 from last segment
+        #   (blocks 6, 7 which were stored)
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 5),
+            (0, 6),
+            (0, 7),
+            (1, 6),
+            (1, 7),
+        ),
+    )
