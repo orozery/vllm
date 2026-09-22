@@ -791,3 +791,286 @@ def test_async_load_reserves_blocks_for_promotion_margin():
     scheduler_output = scheduler.schedule()
     assert req_a.status == RequestStatus.RUNNING
     assert scheduler_output.num_scheduled_tokens[req_a.request_id] > 0
+
+
+def test_async_load_is_reached_after_a_failed_allocation():
+    """A failed allocation must not strand an async load queued behind it.
+
+    The head holds no blocks and cannot fit; the load behind it holds the
+    blocks the head needs. Promotion happens only inside the waiting scan, so
+    stopping at the head leaves the load's blocks held forever with nothing
+    running to free them. The load must still be reached and scheduled, without
+    the failed head's blocks going to anything that does not already hold some.
+    """
+    vllm_config = create_vllm_config()
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    scheduler = create_scheduler(vllm_config, num_blocks=8)  # usable = 7
+
+    parked = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 4,
+        max_tokens=1,
+    )
+    load = create_request(
+        request_id=2,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 5,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    scheduler.add_request(parked)
+    scheduler.add_request(load)
+
+    # The connector cannot answer for `parked` (None), so it is queued holding
+    # no blocks and `load` is admitted, taking 5 of the 7 usable blocks. On the
+    # next step `parked` needs 4 blocks with only 2 free and fails to allocate.
+    with patch.object(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        side_effect=[(None, False), (BLOCK_SIZE * 5, True), (0, False)],
+    ):
+        scheduler_output = scheduler.schedule()
+        assert load.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output([], finished_recving={load.request_id}),
+        )
+        scheduler_output = scheduler.schedule()
+
+    assert load.status == RequestStatus.RUNNING
+    assert scheduler_output.num_scheduled_tokens[load.request_id] > 0
+    # Admission stayed closed: the blockless head did not overtake the load.
+    assert parked.request_id not in scheduler_output.num_scheduled_tokens
+
+    # The engine un-wedges: the load's blocks come back and the head runs.
+    scheduler.update_from_output(
+        scheduler_output, create_model_runner_output([load], use_eos=True)
+    )
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[parked.request_id] > 0
+    scheduler.update_from_output(
+        scheduler_output, create_model_runner_output([parked], use_eos=True)
+    )
+    _ = scheduler.schedule()
+    assert_scheduler_empty(scheduler)
+
+
+def test_failed_allocation_still_breaks_while_requests_are_running():
+    """The walk is only for a scan that would otherwise strand an async load.
+
+    A running request will finish and free blocks, so a load queued behind a
+    blockless head can only be delayed, never stranded. The scan must therefore
+    stop at the head exactly as it does today, and take the walk only once
+    nothing is left running to release blocks.
+    """
+    vllm_config = create_vllm_config()
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    scheduler = create_scheduler(vllm_config, num_blocks=8)  # usable = 7
+
+    head = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 4,
+        max_tokens=1,
+    )
+    load = create_request(
+        request_id=2,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 4,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    runner = create_request(
+        request_id=3,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 2,
+        max_tokens=10,
+    )
+    for request in (head, load, runner):
+        scheduler.add_request(request)
+
+    # `head` is unanswerable on its first lookup, so it is queued holding no
+    # blocks; keyed by request rather than call order so an extra lookup does
+    # not turn into a StopIteration.
+    seen: set[str] = set()
+
+    def matched(request, *args, **kwargs):
+        if request.request_id == load.request_id:
+            return BLOCK_SIZE * 4, True
+        if request.request_id == head.request_id and head.request_id not in seen:
+            seen.add(head.request_id)
+            return None, False
+        return 0, False
+
+    with patch.object(
+        scheduler.connector, "get_num_new_matched_tokens", side_effect=matched
+    ):
+        # `load` takes 4 blocks, `runner` 2, leaving 1 of the 7 usable.
+        scheduler_output = scheduler.schedule()
+        assert load.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert runner.status == RequestStatus.RUNNING
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output(
+                [runner], finished_recving={load.request_id}
+            ),
+        )
+
+        # `head` needs 4 blocks with 1 free and fails. `runner` is still
+        # running, so the scan stops there and leaves the load alone.
+        scheduler_output = scheduler.schedule()
+        assert load.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert load.request_id not in scheduler_output.num_scheduled_tokens
+
+        # Once `runner` is gone, `head` still cannot fit, but now nothing is
+        # running to free blocks, so the load must be reached.
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output([runner], use_eos=True),
+        )
+        scheduler_output = scheduler.schedule()
+
+    assert load.status == RequestStatus.RUNNING
+    assert scheduler_output.num_scheduled_tokens[load.request_id] > 0
+    assert head.request_id not in scheduler_output.num_scheduled_tokens
+
+
+def test_priority_arrival_does_not_strand_an_already_admitted_load():
+    """A load admitted before a higher-priority request must still be reached.
+
+    Under priority scheduling the deadlock cannot be prevented at admission: the
+    load is admitted while it is the only request, and the blockless request that
+    ends up ahead of it arrives afterwards. The failed allocation is the only point
+    that still sees both, so the scan has to recover there. This is also the one case
+    where the request that fails comes from ``waiting`` rather than ``skipped_waiting``
+    and must be left in place rather than deferred.
+    """
+    vllm_config = create_vllm_config()
+    vllm_config.scheduler_config.policy = "priority"
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    scheduler = create_scheduler(vllm_config, num_blocks=8)  # usable = 7
+
+    load = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 5,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    load.priority = 1
+    urgent = create_request(
+        request_id=2, block_size=BLOCK_SIZE, num_tokens=BLOCK_SIZE * 4, max_tokens=1
+    )
+    urgent.priority = 0
+
+    def matched(request, *args, **kwargs):
+        if request.request_id == load.request_id and not request.num_computed_tokens:
+            return BLOCK_SIZE * 5, True
+        return 0, False
+
+    with patch.object(
+        scheduler.connector, "get_num_new_matched_tokens", side_effect=matched
+    ):
+        scheduler.add_request(load)
+        scheduler_output = scheduler.schedule()
+        assert load.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        # Arrives after the load is already parked, and outranks it: the queue
+        # ordering an admission-time check would rely on is now inverted.
+        scheduler.add_request(urgent)
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output([], finished_recving={load.request_id}),
+        )
+        scheduler_output = scheduler.schedule()
+
+    assert load.status == RequestStatus.RUNNING
+    assert scheduler_output.num_scheduled_tokens[load.request_id] > 0
+    assert urgent.request_id not in scheduler_output.num_scheduled_tokens
+    # Left where it was, not deferred out of `waiting`, and still first in line.
+    assert scheduler.waiting.peek_request() is urgent
+
+    scheduler.update_from_output(
+        scheduler_output, create_model_runner_output([load], use_eos=True)
+    )
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[urgent.request_id] > 0
+
+
+def test_promoted_load_that_fails_to_allocate_stays_reachable():
+    """Reaching a parked holder must not depend on state the scan itself mutates.
+
+    The scan promotes a load out of ``WAITING_FOR_REMOTE_KVS`` before trying to
+    schedule it, so a load that is promoted and then fails to allocate ends the step
+    as ``WAITING`` while still holding every block it was admitted with. Keyed on the
+    blocked status, that step would destroy its own trigger: each later step would
+    break at the blockless head again and the load's blocks would be held for good.
+    """
+    vllm_config = create_vllm_config()
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    scheduler = create_scheduler(vllm_config, num_blocks=8)  # usable = 7
+
+    parked = create_request(
+        request_id=1, block_size=BLOCK_SIZE, num_tokens=BLOCK_SIZE * 4, max_tokens=1
+    )
+    load = create_request(
+        request_id=2,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 5,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    scheduler.add_request(parked)
+    scheduler.add_request(load)
+
+    def matched(request, *args, **kwargs):
+        if (
+            request.request_id == load.request_id
+            and request.status == RequestStatus.WAITING
+            and not request.num_computed_tokens
+        ):
+            return BLOCK_SIZE * 5, True
+        if request.request_id == parked.request_id:
+            return None, False
+        return 0, False
+
+    real_allocate = scheduler.kv_cache_manager.allocate_slots
+    load_allocations = 0
+
+    def allocate_failing_first_promotion(request, *args, **kwargs):
+        nonlocal load_allocations
+        if request.request_id == load.request_id:
+            load_allocations += 1
+            if load_allocations == 2:
+                return None
+        return real_allocate(request, *args, **kwargs)
+
+    with patch.object(
+        scheduler.connector, "get_num_new_matched_tokens", side_effect=matched
+    ):
+        scheduler_output = scheduler.schedule()
+        assert load.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.update_from_output(
+            scheduler_output,
+            create_model_runner_output([], finished_recving={load.request_id}),
+        )
+
+        with patch.object(
+            scheduler.kv_cache_manager,
+            "allocate_slots",
+            side_effect=allocate_failing_first_promotion,
+        ):
+            scheduler_output = scheduler.schedule()
+
+        # Promoted but not scheduled, with its blocks still held. The trigger has
+        # to survive that, since nothing else will ever reach this request.
+        assert load.status == RequestStatus.WAITING
+        assert not scheduler_output.num_scheduled_tokens
+        assert scheduler._has_unreached_block_holder()
+
+        scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.num_scheduled_tokens[load.request_id] > 0
+    assert parked.request_id not in scheduler_output.num_scheduled_tokens

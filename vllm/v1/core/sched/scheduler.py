@@ -855,6 +855,9 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # Set once an allocation fails: for the rest of the step, only
+            # requests that already hold blocks may still be scheduled.
+            admission_closed = False
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
@@ -865,11 +868,29 @@ class Scheduler(SchedulerInterface):
                 if num_running >= self.max_num_active_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
+                if admission_closed:
+                    # Only `skipped_waiting` can hold an async load that needs
+                    # this scan to reach it; a block holder in `waiting` is
+                    # schedulable on a later step without promotion.
+                    if not self.skipped_waiting:
+                        break
+                    request_queue = self.skipped_waiting
+                else:
+                    request_queue = self._select_waiting_queue_for_scheduling()
+                    assert request_queue is not None
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if admission_closed and not self._holds_kv_blocks(request):
+                    # Holding no blocks, it could only take blocks from the
+                    # request that just failed to allocate. Defer it before
+                    # promoting: promoting a request this step will not go on
+                    # to schedule leaves it parked in a state that no longer
+                    # tells this scan its blocks are still held.
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1219,7 +1240,17 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    break
+                    if self.running or not self._has_unreached_block_holder():
+                        break
+                    # Nothing is running left to free blocks, and a parked
+                    # holder is only reached from inside this scan, so stopping
+                    # here leaves its blocks held for good. Close admission and
+                    # walk the rest of `skipped_waiting` to reach it.
+                    admission_closed = True
+                    if request_queue is self.skipped_waiting:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -2950,6 +2981,29 @@ class Scheduler(SchedulerInterface):
         """Num blocks in-flight prefills still need to finish (their reservation)."""
         return sum(
             self._request_remaining_blocks(req) for req in self._inflight_prefills
+        )
+
+    def _holds_kv_blocks(self, request: Request) -> bool:
+        return any(self.kv_cache_manager.get_block_ids(request.request_id))
+
+    def _has_unreached_block_holder(self) -> bool:
+        """Whether `skipped_waiting` holds blocks only this scan can release.
+
+        Such a request was admitted with blocks and stays parked until the waiting
+        scan reaches it, so a scan that stops short can leave those blocks held with
+        nothing running left to free them.
+
+        Ownership is queried directly instead of inferred from status or computed
+        tokens, both of which the step mutates under it: this scan promotes a load
+        out of `WAITING_FOR_REMOTE_KVS` before scheduling it, and a load whose
+        transfer failed under `recompute` has no computed tokens while still holding
+        its blocks. Streaming waits are excluded because this scan cannot schedule
+        them at all, so reaching one releases nothing.
+        """
+        return any(
+            req.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            and self._holds_kv_blocks(req)
+            for req in self.skipped_waiting
         )
 
     def _mark_prefix_replay(self, request: Request, num_hit_tokens: int) -> int:
