@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import weakref
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -104,8 +105,113 @@ class BlockHashToBlockMap:
         self._dup_ids.clear()
 
 
-class BlockPool:
+class BlockAllocator(ABC):
+    """Device allocation half of a pool: free lists, refcounts, copy-on-write
+    and the null block.
+
+    Off device these concepts do not exist, so a storage-only medium
+    implements `BlockTier` alone. A block-structured medium reuses this half.
+    """
+
+    # The placeholder block with `block_id=0`. Its `ref_cnt` is not maintained.
+    null_block: KVCacheBlock
+    hash_block_size: int
+
+    @abstractmethod
+    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]: ...
+
+    @abstractmethod
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], evict_first: bool = False
+    ) -> None: ...
+
+    @abstractmethod
+    def touch(self, blocks: Sequence[KVCacheBlock]) -> None: ...
+
+    @abstractmethod
+    def unpin_blocks(
+        self,
+        blocks: Iterable[KVCacheBlock],
+        on_reuse: Callable[[KVCacheBlock], None],
+    ) -> None: ...
+
+    @abstractmethod
+    def get_num_free_blocks(self) -> int: ...
+
+    @abstractmethod
+    def get_usage(self) -> float: ...
+
+    @abstractmethod
+    def move_block_hashes(
+        self, src_block: KVCacheBlock, dst_block: KVCacheBlock
+    ) -> None: ...
+
+    @abstractmethod
+    def is_block_writable(self, block: KVCacheBlock) -> bool: ...
+
+    @abstractmethod
+    def cache_partial_block(
+        self,
+        request: Request,
+        block: KVCacheBlock,
+        num_tokens: int,
+        kv_cache_group_id: int,
+        block_size: int,
+        replace_existing_hashes: bool = False,
+    ) -> BlockHashWithGroupId | None: ...
+
+
+class BlockTier(ABC):
+    """Hash-indexed half of a pool: lookup, commit, eviction and events.
+
+    A tier answers "what do you hold for this block hash?" for a reusable
+    prefix, for any medium; it need not be a pool.
+    """
+
+    medium: str
+
+    @abstractmethod
+    def get_cached_block(
+        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+    ) -> list[KVCacheBlock] | None: ...
+
+    @abstractmethod
+    def cache_full_blocks(
+        self,
+        request: Request,
+        blocks: list[KVCacheBlock],
+        num_cached_blocks: int,
+        num_full_blocks: int,
+        block_size: int,
+        kv_cache_group_id: int,
+        block_mask: list[bool] | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def emit_cached_block_events(
+        self,
+        request: Request,
+        num_cached_blocks: int,
+        block_size: int,
+        kv_cache_group_id: int,
+    ) -> None: ...
+
+    @abstractmethod
+    def evict_blocks(self, block_ids: set[int]) -> None: ...
+
+    @abstractmethod
+    def reset_prefix_cache(self) -> bool: ...
+
+    @abstractmethod
+    def take_events(self) -> list[KVCacheEvent]: ...
+
+
+class BlockPool(BlockAllocator, BlockTier):
     """BlockPool that manages KVCacheBlocks.
+
+    Implements both `BlockAllocator` (device allocation) and `BlockTier`
+    (hash-indexed lookup, commit and eviction).
+
     It provides methods to allocate, free and cache the kv cache blocks. The
     free_block_queue stores the free blocks in eviction order to enable
     allocation, free, and cache eviction. The cached_block_hash_to_block
