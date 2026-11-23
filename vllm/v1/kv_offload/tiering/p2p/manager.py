@@ -441,12 +441,17 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     # ------------------------------------------------------------------
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
         source = req_context.get_state(P2PSourceInfo)
         if source is None:
-            return LookupResult.MISS
+            return [LookupResult.MISS] * len(keys)
         if source.kv_request_id in self._failed_req_ids:
-            return LookupResult.MISS
+            return [LookupResult.MISS] * len(keys)
 
         # Symmetric-P2P consumer (``remote_kv_source`` sub-dict): probe the
         # peer asynchronously. First call registers the (kv_request_id,
@@ -458,19 +463,23 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         if source.do_probe:
             session = self._sessions.get(source.peer_id)
             if session is None or not session.ready:
-                return LookupResult.MISS
-            result = session.register_lookup(source.kv_request_id, key)
-            if result is True:
-                return LookupResult.HIT
-            if result is False:
-                return LookupResult.MISS
-            return LookupResult.RETRY
+                return [LookupResult.MISS] * len(keys)
+            results: list[LookupResult] = []
+            for key in keys:
+                result = session.register_lookup(source.kv_request_id, key)
+                if result is True:
+                    results.append(LookupResult.HIT)
+                elif result is False:
+                    results.append(LookupResult.MISS)
+                else:
+                    results.append(LookupResult.RETRY)
+            return results
 
         # PD stores bind to round 0. A later fetch after preemption or partial
         # promotion cannot be supplied and would wait out the PD load timeout.
         if source.pd_fetch_submitted:
-            return LookupResult.MISS
-        return LookupResult.HIT
+            return [LookupResult.MISS] * len(keys)
+        return [LookupResult.HIT] * len(keys)
 
     @override
     def on_new_request(self, req_context: ReqContext) -> SecondaryTierRequestContext:

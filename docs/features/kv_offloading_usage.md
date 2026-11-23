@@ -481,6 +481,8 @@ Implement `SecondaryTierManager` (`vllm/v1/kv_offload/tiering/base.py`) in your 
 
 `type` is checked against the built-in registry first; if it isn't a registered name, vLLM imports `module_path` and looks up `type` as a class name in that module.
 
+A tier's `lookup()` receives an ordered batch of keys and their end-token positions, and returns one `LookupResult` per key, in order. The call is total: it does not stop at a miss or search for a sliding window — those scan rules stay in the connector. Tiers written against the previous per-key signature adapt by looping over the batch.
+
 ## Tuning Tips
 
 - `cpu_bytes_to_use`: a bigger CPU tier means fewer trips to slower secondary tiers and a higher hit rate. The value is total across all workers, not per-worker. Leave headroom for the rest of the host workload.

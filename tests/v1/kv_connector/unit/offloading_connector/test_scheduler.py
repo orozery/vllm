@@ -59,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    _LOOKUP_PAGE_MIN,
     OffloadingConnectorScheduler,
     _create_req_context,
 )
@@ -139,6 +140,24 @@ from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.config import (
 def _as_mock(value: object) -> MagicMock:
     assert isinstance(value, MagicMock)
     return value
+
+
+def _as_batched(lookup):
+    """Adapt a per-key lookup to the manager's batched signature."""
+
+    def batched(keys, positions, req_context):
+        return [lookup(key, req_context) for key in keys]
+
+    return batched
+
+
+def _lookup_all(result: LookupResult):
+    """Manager lookup side effect answering `result` for every key."""
+
+    def batched(keys, positions, req_context):
+        return [result] * len(keys)
+
+    return batched
 
 
 def test_update_offload_keys_without_scanning_hash_prefix():
@@ -1163,7 +1182,7 @@ def test_partial_lookup_and_load_address_each_group_block_size_under_dcp():
     request = _make_dcp_shaped_request(scheduler, num_tokens=46)
     req_status = scheduler._req_status["req"]
     req_status.update_offload_keys()
-    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     assert scheduler._lookup(req_status) == 44
     assert req_status.partial_tail_boundary == 44
 
@@ -1235,7 +1254,7 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
 
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
     assert scheduler._lookup(req_status) == 28
 
     assert req_status.partial_tail_boundary == 28
@@ -1267,7 +1286,7 @@ def test_partial_tail_hit_still_stores_the_containing_chunk():
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
     _as_mock(scheduler.manager.prepare_store).side_effect = (
         lambda keys, req_context, trigger: generate_store_output(keys)
     )
@@ -1353,7 +1372,7 @@ def test_sync_partial_tail_load_targets_hashed_blocks():
     scheduler.config = scheduler.config._replace(sync_load_budget_bytes=1 << 40)
     request = _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]
-    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (28, False)
     assert "req" in scheduler._current_batch_sync_loads
@@ -1389,7 +1408,7 @@ def test_sync_load_budget_is_shared_per_step():
     scheduler.config = scheduler.config._replace(sync_load_budget_bytes=hit_bytes)
     first = _make_partial_tail_request(scheduler, request_id="a")
     second = _make_partial_tail_request(scheduler, request_id="b")
-    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
 
     assert scheduler.get_num_new_matched_tokens(first, 0) == (28, False)
     assert scheduler.get_num_new_matched_tokens(second, 0) == (28, True)
@@ -1400,7 +1419,7 @@ def test_lookup_cap_stops_at_authoritative_prefix_boundary():
     scheduler = _make_partial_tail_scheduler()
     request = _make_partial_tail_request(scheduler)
     request.skip_reading_external_kv = False
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
 
     tokens, load_async = scheduler.get_num_new_matched_tokens(
         request, 0, max_num_new_tokens=20
@@ -1415,7 +1434,7 @@ def test_max_load_tokens_zero_skips_partial_tail_lookup():
     request = _make_partial_tail_request(
         scheduler, kv_transfer_params={"max_load_tokens": 0}
     )
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
 
     assert scheduler.get_num_new_matched_tokens(request, 16) == (0, False)
     _as_mock(scheduler.manager.lookup).assert_not_called()
@@ -1429,7 +1448,7 @@ def test_max_load_tokens_caps_tokens_beyond_gpu_prefix():
     request = _make_partial_tail_request(
         scheduler, kv_transfer_params={"max_load_tokens": 8}
     )
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
 
     assert scheduler.get_num_new_matched_tokens(request, 16) == (8, True)
     assert scheduler._req_status["req"].partial_tail_boundary == 24
@@ -1468,7 +1487,7 @@ def test_sparse_group_miss_registers_shared_prefix_junction():
     request = _make_partial_tail_request(scheduler)
     request.shared_prefix_boundary = 0
     stored: set[OffloadKey] = set()
-    scheduler.manager.lookup.side_effect = _hybrid_lookup(stored)
+    scheduler.manager.lookup.side_effect = _as_batched(_hybrid_lookup(stored))
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     assert request.shared_prefix_boundary == 16
@@ -1494,7 +1513,7 @@ def test_shared_prefix_junction_is_not_lowered():
     request = _make_partial_tail_request(scheduler)
     # e.g. a longer junction from the local prefix cache
     request.shared_prefix_boundary = 24
-    scheduler.manager.lookup.side_effect = _hybrid_lookup(set())
+    scheduler.manager.lookup.side_effect = _as_batched(_hybrid_lookup(set()))
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     assert request.shared_prefix_boundary == 24
@@ -1543,11 +1562,11 @@ def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
         manager.prepare_store(pending, producer, trigger=StoreTrigger.ON_COMPUTE)
         is not None
     )
-    assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+    assert manager.lookup([pending[0]], None, producer)[0] is LookupResult.HIT_PENDING
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
     assert request.shared_prefix_boundary == 32
-    assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+    assert manager.lookup([pending[0]], None, producer)[0] is LookupResult.HIT_PENDING
 
 
 def test_unconfirmed_attention_does_not_register_junction():
@@ -1588,7 +1607,7 @@ def test_no_shared_prefix_junction_when_sparse_group_hits():
     scheduler = _make_sparse_retention_scheduler()
     request = _make_partial_tail_request(scheduler)
     request.shared_prefix_boundary = 0
-    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
 
     tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
     assert tokens == 28
@@ -1602,7 +1621,7 @@ def test_max_load_tokens_rounds_down_without_partial_tail():
     request = _make_partial_tail_request(
         scheduler, kv_transfer_params={"max_load_tokens": 20}
     )
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
 
@@ -1650,7 +1669,7 @@ def test_max_load_tokens_preserves_aligned_sliding_window_chunk(
         kv_transfer_params=kv_transfer_params,
     )
     request = runner.scheduler.requests[str(runner.req_id)]
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
 
     assert runner.connector_scheduler.get_num_new_matched_tokens(request, 0) == (
         expected_tokens,
@@ -1664,7 +1683,7 @@ def test_invalid_max_load_tokens_is_ignored(value):
     request = _make_partial_tail_request(
         scheduler, kv_transfer_params={"max_load_tokens": value}
     )
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (28, True)
 
@@ -1745,7 +1764,7 @@ def test_external_cache_hit_sources_preserve_partial_tail_origin(
     req_status = scheduler._req_status["req"]
     req_status.update_offload_keys()
 
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
     assert scheduler._lookup(req_status) == 28
 
     def get_load_source(key, req_context):
@@ -1882,7 +1901,7 @@ def test_external_cache_hit_sources_recurrent_only_state(source):
     request.all_token_ids = list(range(64))
     state = scheduler._req_status[request.request_id]
     state.update_offload_keys()
-    _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
+    _as_mock(scheduler.manager.lookup).side_effect = _lookup_all(LookupResult.HIT)
     assert scheduler._lookup(state) == 48
     _as_mock(scheduler.manager.get_load_source).return_value = source
     scheduler.update_state_after_alloc(
@@ -2006,6 +2025,48 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
     assert scheduler.get_external_cache_hit_sources(request, 0) == {}
 
 
+@pytest.mark.cpu_test
+def test_lookup_positions_match_request_context():
+    """Probed keys carry the position the request recorded for them.
+
+    Candidate partial-tail boundaries are probed before one is chosen, so
+    only the chosen boundary's keys enter the request's key map.
+    """
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+
+    recorded: list[tuple[list[OffloadKey], list[int]]] = []
+
+    def lookup(keys, positions, req_context):
+        recorded.append((list(keys), list(positions)))
+        # Chunk and bridge keys are already in the request's key map; the
+        # unregistered keys are the candidate boundary keys.
+        return [
+            LookupResult.MISS
+            if req_context.get_offload_key_position(key) is not None
+            else LookupResult.HIT
+            for key in keys
+        ]
+
+    scheduler.manager.lookup.side_effect = lookup
+    assert scheduler._lookup(req_status) is not None
+    boundary = req_status.partial_tail_boundary
+    assert boundary is not None
+
+    assert recorded
+    for keys, positions in recorded:
+        for key, position in zip(keys, positions):
+            registered = req_status.req_context.get_offload_key_position(key)
+            if registered is not None:
+                assert registered == position
+
+    for group_config in scheduler.config.kv_group_configs:
+        key = req_status.boundary_key(group_config.group_idx, boundary)
+        assert req_status.req_context.get_offload_key_position(key) == boundary
+
+
 @pytest.mark.parametrize("missing_group", [0, 1])
 def test_partial_lookup_requires_every_cache_group(missing_group):
     """The tail at 28 (h6) needs both the attention and the Mamba key."""
@@ -2023,7 +2084,7 @@ def test_partial_lookup_requires_every_cache_group(missing_group):
             return LookupResult.MISS
         return LookupResult.HIT
 
-    _as_mock(scheduler.manager.lookup).side_effect = lookup
+    _as_mock(scheduler.manager.lookup).side_effect = _as_batched(lookup)
     assert scheduler._lookup(req_status) == 16
     assert req_status.partial_tail_boundary is None
 
@@ -2051,7 +2112,7 @@ def _make_anchored_partial_tail_request(scheduler, hits, num_tokens=30):
     request = _make_partial_tail_request(scheduler, num_tokens=num_tokens)
     req_status = scheduler._req_status["req"]
     req_status.update_offload_keys()
-    scheduler.manager.lookup.side_effect = _resident_lookup(hits)
+    scheduler.manager.lookup.side_effect = _as_batched(_resident_lookup(hits))
     return request, req_status
 
 
@@ -2118,12 +2179,13 @@ def test_partial_lookup_defers_only_for_viable_pending_boundary(
     scheduler = _make_partial_tail_scheduler()
     request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
 
-    def lookup(key, req_context):
-        if req_context.get_offload_key_position(key) == 12:
-            return (
-                pending_result if get_offload_group_idx(key) == 0 else required_result
-            )
-        return LookupResult.MISS
+    def lookup(keys, positions, req_context):
+        return [
+            (pending_result if get_offload_group_idx(key) == 0 else required_result)
+            if position == 12
+            else LookupResult.MISS
+            for key, position in zip(keys, positions)
+        ]
 
     scheduler.manager.lookup.side_effect = lookup
     assert scheduler.get_num_new_matched_tokens(request, 0) == (expected, False)
@@ -2174,9 +2236,9 @@ def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
     def lookup(key, req_context):
         if get_offload_group_idx(key) == 0 and get_offload_block_hash(key) == b"h3":
             return LookupResult.HIT_PENDING
-        return resident(key, req_context)
+        return resident([key], None, req_context)[0]
 
-    scheduler.manager.lookup.side_effect = lookup
+    scheduler.manager.lookup.side_effect = _as_batched(lookup)
     assert scheduler._lookup(req_status) == 0
     assert req_status.partial_tail_boundary is None
 
@@ -2297,7 +2359,7 @@ def test_partial_lookup_after_recurrent_group_tightens_hit():
         ready = group_idx == 0 or block_hash in (b"h3", b"h6")
         return LookupResult.HIT if ready else LookupResult.MISS
 
-    scheduler.manager.lookup.side_effect = lookup
+    scheduler.manager.lookup.side_effect = _as_batched(lookup)
     assert scheduler._lookup(req_status) == 28
     assert req_status.partial_tail_boundary == 28
     assert lookups.count("0h7") == 1
@@ -2327,8 +2389,10 @@ def test_partial_tail_round_trip_serves_mamba_checkpoint(cow_on_completion_step)
     """Store, finish and reload a hash-ready Mamba partial checkpoint."""
     scheduler = _make_partial_tail_scheduler()
     stored: set = set()
-    scheduler.manager.lookup.side_effect = lambda key, req_context: (
-        LookupResult.HIT if key in stored else LookupResult.MISS
+    scheduler.manager.lookup.side_effect = _as_batched(
+        lambda key, req_context: (
+            LookupResult.HIT if key in stored else LookupResult.MISS
+        )
     )
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output(keys)
@@ -2471,7 +2535,7 @@ def test_cache_reset_holds_promotions_until_flushed_jobs_report(promotes):
         # The engine must keep stepping until the flushed jobs report, even
         # with no request left: the flush still has to reach the workers.
         assert scheduler.has_requests()
-        assert manager.lookup(key, ctx) is LookupResult.MISS
+        assert manager.lookup([key], None, ctx)[0] is LookupResult.MISS
         output = scheduler.schedule()
         meta = output.kv_connector_metadata
         assert isinstance(meta, OffloadingConnectorMetadata)
@@ -2479,7 +2543,7 @@ def test_cache_reset_holds_promotions_until_flushed_jobs_report(promotes):
         _report_jobs(scheduler, output, flushed)
 
         assert not scheduler.has_requests()
-        promoted = manager.lookup(key, ctx) is not LookupResult.MISS
+        promoted = manager.lookup([key], None, ctx)[0] is not LookupResult.MISS
         assert promoted is promotes
         manager.on_request_finished(ctx)
     finally:
@@ -3064,7 +3128,12 @@ def test_scheduler_reports_lookup_async_delay_on_resolve(request_runner):
         num_gpu_blocks=10,
         async_scheduling=False,
     )
-    runner.manager.lookup.side_effect = [LookupResult.RETRY, LookupResult.MISS]
+    results = iter([LookupResult.RETRY, LookupResult.MISS])
+
+    def lookup(keys, positions, req_context):
+        return [next(results, LookupResult.MISS)] * len(keys)
+
+    runner.manager.lookup.side_effect = lookup
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -3083,7 +3152,7 @@ def test_max_offload_tokens_zero_does_not_record_pending_lookups(request_runner)
         num_gpu_blocks=10,
         async_scheduling=False,
     )
-    runner.manager.lookup.return_value = LookupResult.RETRY
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.RETRY)
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output(keys)
     )
@@ -3095,11 +3164,12 @@ def test_max_offload_tokens_zero_does_not_record_pending_lookups(request_runner)
     runner.run(decoded_tokens=[])
 
     tracker = runner.connector_scheduler._events_tracker
-    assert runner.manager.lookup.call_count == 3
+    # One total probe over the request's chunks, not one call per chunk.
+    assert len(runner.manager.lookup.call_args_list[0].args[0]) == 3
     assert not tracker._pending_event_metadata
     assert list(runner.connector_scheduler.take_events()) == []
 
-    runner.manager.lookup.return_value = LookupResult.MISS
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.MISS)
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     assert not tracker._pending_event_metadata
@@ -3122,7 +3192,7 @@ def test_abort_before_hit_uses_placeholder_then_later_hit_heals_removal(
         raw_events.clear()
         return StepResult(events=events)
 
-    runner.manager.lookup.return_value = LookupResult.RETRY
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.RETRY)
     runner.manager.on_schedule_end.side_effect = on_schedule_end
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
@@ -3133,7 +3203,7 @@ def test_abort_before_hit_uses_placeholder_then_later_hit_heals_removal(
 
     tracker = runner.connector_scheduler._events_tracker
     assert not tracker._pending_event_metadata
-    key = runner.manager.lookup.call_args.args[0]
+    key = runner.manager.lookup.call_args.args[0][0]
     req_id = str(runner.req_id)
     req_status = runner.connector_scheduler._req_status[req_id]
 
@@ -3149,15 +3219,11 @@ def test_abort_before_hit_uses_placeholder_then_later_hit_heals_removal(
     assert events[0].block_size == 0
     assert events[0].token_ids == []
 
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     group_config = runner.connector_scheduler.config.kv_group_configs[0]
     assert (
         runner.connector_scheduler._maximal_prefix_lookup(
-            [key],
-            req_status.req_context,
-            req_status.req,
-            group_config,
-            0,
+            [key], None, req_status.req_context, req_status.req, group_config, 0
         )
         == 1
     )
@@ -3207,7 +3273,7 @@ def test_promotion_hit_precedes_stored_event_translation(
         raw_events.clear()
         return StepResult(events=events)
 
-    runner.manager.lookup.side_effect = lookup
+    runner.manager.lookup.side_effect = _as_batched(lookup)
     runner.manager.on_schedule_end.side_effect = on_schedule_end
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
@@ -3963,7 +4029,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
 
     # full 3 blocks hit [0, 1, 2]
     runner.new_request(token_ids=[0] * (block_size * 3 + 1))
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         # Group 0 (full attn): prefix lookup hits 3 → loads blocks 0,1,2
@@ -3975,7 +4041,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     # 3 blocks are hit on GPU [0, 1, 2]
     # 1 block loaded [3,]
     runner.new_request(token_ids=[0] * (block_size * 4 + 1))
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         # Group 0 (full attn): prefix lookup hits 3 → loads blocks 0,1,2
@@ -4014,8 +4080,10 @@ def test_sliding_window_chunk_with_null_block_is_not_stored(
         stored_keys.update(keys)
         return generate_store_output(keys)
 
-    runner.manager.lookup.side_effect = lambda key, req_context: (
-        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    runner.manager.lookup.side_effect = _as_batched(
+        lambda key, req_context: (
+            LookupResult.HIT if key in stored_keys else LookupResult.MISS
+        )
     )
 
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
@@ -4176,7 +4244,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     # 48 tokens (3 block) from the second group
     # Total 48 tokens can be loaded
     runner.new_request(token_ids=[0] * 48)
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -4192,7 +4260,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     # extra tokens [0, 36] (blocks [4, 5, 6]) from the first group
     # extra tokens [0, 32] (block [3, 4]) from the second group
     runner.new_request(token_ids=[0] * (48 + 37))
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -4224,7 +4292,7 @@ def _make_scheduler_with_lookup(
             return default
         return lookup_results.get(int(block_hash.decode()), default)
 
-    manager.lookup.side_effect = lookup
+    manager.lookup.side_effect = _as_batched(lookup)
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
@@ -4240,23 +4308,20 @@ _LOOKUP_GROUP_CONFIG = MagicMock()
 
 def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
     return sched._maximal_prefix_lookup(
-        keys,
-        _EMPTY_REQ_CTX,
-        _LOOKUP_REQ,
-        _LOOKUP_GROUP_CONFIG,
-        start_chunk_idx,
+        keys, None, _EMPTY_REQ_CTX, _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, start_chunk_idx
     )
 
 
 # Lookups issued, and end index returned, by a window-1 scan over 3 keys all
-# resolving to the same result. A result that keeps the streak alive ends the
-# scan at the first key; one that resets it makes the scan walk every key,
-# which is what widens the demanded set. A new member has to be added here.
+# resolving to the same result. A result that keeps the streak alive settles
+# the scan within the one-key tail page; one that resets it makes the scan
+# demand the rest, which goes out as a second batched call. A new member has
+# to be added here.
 _SCAN_BEHAVIOR = {
     LookupResult.HIT: (1, 3),
     LookupResult.HIT_PENDING: (1, None),
-    LookupResult.RETRY: (3, None),
-    LookupResult.MISS: (3, 0),
+    LookupResult.RETRY: (2, None),
+    LookupResult.MISS: (2, 0),
 }
 
 
@@ -4270,7 +4335,7 @@ def test_scan_behavior_declared_for_every_lookup_result(result: LookupResult):
     keys = to_keys([1, 2, 3])
     sched = _make_scheduler_with_lookup(dict.fromkeys([1, 2, 3], result))
 
-    assert sched._sliding_window_lookup(keys, 1, _EMPTY_REQ_CTX) == expected_end
+    assert sched._sliding_window_lookup(keys, None, 1, _EMPTY_REQ_CTX) == expected_end
     assert len(_as_mock(sched.manager.lookup).call_args_list) == expected_lookups
 
 
@@ -4289,13 +4354,49 @@ def test_sliding_window_unaligned_initial_run(middle, expected):
     # needs the usual two chunks. Pending/uncertain keys must still defer.
     assert (
         sched._sliding_window_lookup(
-            to_keys([1, 2, 3, 4, 5]), 2, _EMPTY_REQ_CTX, initial_window_size=3
+            to_keys([1, 2, 3, 4, 5]), None, 2, _EMPTY_REQ_CTX, initial_window_size=3
         )
         == expected
     )
 
 
 class TestMaximalPrefixLookup:
+    def test_one_batched_call_forwards_positions(self):
+        keys = to_keys([1, 2, 3])
+        positions = [16, 32, 48]
+        sched = _make_scheduler_with_lookup(dict.fromkeys([1, 2, 3], LookupResult.HIT))
+        assert (
+            sched._maximal_prefix_lookup(
+                keys,
+                positions,
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                0,
+            )
+            == 3
+        )
+        _as_mock(sched.manager.lookup).assert_called_once_with(
+            keys, positions, _EMPTY_REQ_CTX
+        )
+
+    def test_cold_prefix_probes_one_small_page(self):
+        """A miss on the first page stops the scan; nothing past it is probed."""
+        keys = to_keys(range(100))
+        sched = _make_scheduler_with_lookup({})
+        assert _maximal_lookup(sched, keys) == 0
+        calls = _as_mock(sched.manager.lookup).call_args_list
+        assert len(calls) == 1
+        assert len(calls[0].args[0]) == _LOOKUP_PAGE_MIN
+
+    def test_long_prefix_pages_logarithmically(self):
+        keys = to_keys(range(1000))
+        sched = _make_scheduler_with_lookup(
+            dict.fromkeys(range(1000), LookupResult.HIT)
+        )
+        assert _maximal_lookup(sched, keys) == 1000
+        assert _as_mock(sched.manager.lookup).call_count < 12
+
     def test_all_hit(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
         assert _maximal_lookup(sched, to_keys([1, 2])) == 2
@@ -4365,7 +4466,9 @@ class TestMaximalPrefixLookup:
             {1: LookupResult.RETRY, 2: LookupResult.HIT}
         )
         assert _maximal_lookup(sched, keys) is None
-        assert _as_mock(sched.manager.lookup).call_count == 2
+        _as_mock(sched.manager.lookup).assert_called_once_with(
+            keys, None, _EMPTY_REQ_CTX
+        )
         _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
             _LOOKUP_REQ,
             _LOOKUP_GROUP_CONFIG,
@@ -4392,7 +4495,9 @@ class TestMaximalPrefixLookup:
             {1: LookupResult.HIT_PENDING, 2: LookupResult.HIT}
         )
         assert _maximal_lookup(sched, keys) is None
-        assert _as_mock(sched.manager.lookup).call_count == 2
+        _as_mock(sched.manager.lookup).assert_called_once_with(
+            keys, None, _EMPTY_REQ_CTX
+        )
         assert _as_mock(sched._events_tracker.record_lookup).call_args_list == [
             call(_LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, i, key)
             for i, key in enumerate(keys)
@@ -4403,10 +4508,13 @@ class TestMaximalPrefixLookup:
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT_PENDING, 2: LookupResult.MISS, 3: LookupResult.HIT}
         )
-        assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
-        assert _as_mock(sched.manager.lookup).call_count == 2
+        keys = to_keys([1, 2, 3])
+        assert _maximal_lookup(sched, keys) is None
+        _as_mock(sched.manager.lookup).assert_called_once_with(
+            keys, None, _EMPTY_REQ_CTX
+        )
         _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
-            _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
+            _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, keys[0]
         )
 
     def test_retry_stops_at_miss(self):
@@ -4414,47 +4522,93 @@ class TestMaximalPrefixLookup:
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.RETRY, 2: LookupResult.MISS, 3: LookupResult.HIT}
         )
-        assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
-        # lookup should have been called for blocks 1 and 2 (stops at miss)
-        assert _as_mock(sched.manager.lookup).call_count == 2
+        keys = to_keys([1, 2, 3])
+        assert _maximal_lookup(sched, keys) is None
+        # One total call over the slice; the scan stops at the miss.
+        _as_mock(sched.manager.lookup).assert_called_once_with(
+            keys, None, _EMPTY_REQ_CTX
+        )
         _as_mock(sched._events_tracker.record_lookup).assert_not_called()
 
 
 class TestSlidingWindowLookup:
+    def test_warm_tail_settles_in_one_call(self):
+        keys = to_keys([1, 2, 3, 4])
+        sched = _make_scheduler_with_lookup({3: LookupResult.HIT, 4: LookupResult.HIT})
+        assert sched._sliding_window_lookup(keys, None, 2, _EMPTY_REQ_CTX) == 4
+        calls = _as_mock(sched.manager.lookup).call_args_list
+        assert [list(call.args[0]) for call in calls] == [[keys[2], keys[3]]]
+
+    def test_fragmented_tail_probes_rest_in_one_more_call(self):
+        keys = to_keys([1, 2, 3, 4])
+        sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
+        assert sched._sliding_window_lookup(keys, None, 2, _EMPTY_REQ_CTX) == 2
+        calls = _as_mock(sched.manager.lookup).call_args_list
+        assert [list(call.args[0]) for call in calls] == [
+            [keys[2], keys[3]],
+            [keys[0], keys[1]],
+        ]
+
+    def test_fragmented_tail_pages_the_history(self):
+        """A window near the right edge costs a page, not the whole history."""
+        keys = to_keys(range(100))
+        hits = {90: LookupResult.HIT, 91: LookupResult.HIT}
+        sched = _make_scheduler_with_lookup(hits)
+        assert sched._sliding_window_lookup(keys, None, 2, _EMPTY_REQ_CTX) == 92
+        calls = _as_mock(sched.manager.lookup).call_args_list
+        probed = sum(len(call.args[0]) for call in calls)
+        assert probed == 2 + _LOOKUP_PAGE_MIN * 2
+
     def test_pending_chunk_behind_gap_does_not_defer(self):
         """A pending suffix too short for the window cannot improve the hit."""
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT, 2: LookupResult.HIT, 4: LookupResult.HIT_PENDING}
         )
         assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), 2, _EMPTY_REQ_CTX) == 2
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), None, 2, _EMPTY_REQ_CTX)
+            == 2
         )
 
     def test_all_hit_exact_window(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
-        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) == 2
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2]), None, 2, _EMPTY_REQ_CTX) == 2
+        )
 
     def test_all_miss(self):
         sched = _make_scheduler_with_lookup({})
-        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 1, _EMPTY_REQ_CTX) == 0
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3]), None, 1, _EMPTY_REQ_CTX)
+            == 0
+        )
 
     def test_window_at_end(self):
         sched = _make_scheduler_with_lookup({2: LookupResult.HIT, 3: LookupResult.HIT})
-        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 2, _EMPTY_REQ_CTX) == 3
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3]), None, 2, _EMPTY_REQ_CTX)
+            == 3
+        )
 
     def test_window_in_middle(self):
         sched = _make_scheduler_with_lookup({2: LookupResult.HIT, 3: LookupResult.HIT})
         assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), 2, _EMPTY_REQ_CTX) == 3
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), None, 2, _EMPTY_REQ_CTX)
+            == 3
         )
 
     def test_no_full_window_falls_back_to_prefix(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
-        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) == 2
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3]), None, 3, _EMPTY_REQ_CTX)
+            == 2
+        )
 
     def test_single_block_window(self):
         sched = _make_scheduler_with_lookup({2: LookupResult.HIT, 3: LookupResult.HIT})
-        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 1, _EMPTY_REQ_CTX) == 3
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3]), None, 1, _EMPTY_REQ_CTX)
+            == 3
+        )
 
     def test_gap_resets_consecutive(self):
         sched = _make_scheduler_with_lookup(
@@ -4462,7 +4616,9 @@ class TestSlidingWindowLookup:
         )
         # [1, 2, 3, 0, 4] — gap at 0 resets, window of 2 found at [2,3]
         assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3, 0, 4]), 2, _EMPTY_REQ_CTX)
+            sched._sliding_window_lookup(
+                to_keys([1, 2, 3, 0, 4]), None, 2, _EMPTY_REQ_CTX
+            )
             == 3
         )
 
@@ -4478,7 +4634,9 @@ class TestSlidingWindowLookup:
         # two valid windows: [1,2] at positions 0-1 and [4,5] at positions 3-4
         # scans right-to-left, finds [4,5] first
         assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3, 4, 5]), 2, _EMPTY_REQ_CTX)
+            sched._sliding_window_lookup(
+                to_keys([1, 2, 3, 4, 5]), None, 2, _EMPTY_REQ_CTX
+            )
             == 5
         )
 
@@ -4493,19 +4651,24 @@ class TestSlidingWindowLookup:
         )
         # window of 4 not found contiguously (gap at 1)
         assert (
-            sched._sliding_window_lookup(to_keys([2, 1, 3, 4, 5]), 4, _EMPTY_REQ_CTX)
+            sched._sliding_window_lookup(
+                to_keys([2, 1, 3, 4, 5]), None, 4, _EMPTY_REQ_CTX
+            )
             == 1
         )
 
     def test_empty(self):
         sched = _make_scheduler_with_lookup({})
-        assert sched._sliding_window_lookup([], 1, _EMPTY_REQ_CTX) == 0
+        assert sched._sliding_window_lookup([], None, 1, _EMPTY_REQ_CTX) == 0
 
     def test_retry_defers(self):
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT, 2: LookupResult.RETRY}
         )
-        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) is None
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2]), None, 2, _EMPTY_REQ_CTX)
+            is None
+        )
 
     def test_retry_with_full_window_still_defers(self):
         """Even if a real window is found after a RETRY, result is deferred."""
@@ -4520,7 +4683,7 @@ class TestSlidingWindowLookup:
             }
         )
         assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), 2, _EMPTY_REQ_CTX)
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), None, 2, _EMPTY_REQ_CTX)
             is None
         )
 
@@ -4530,7 +4693,10 @@ class TestSlidingWindowLookup:
             {1: LookupResult.HIT, 2: LookupResult.HIT_PENDING}
         )
         # window=2: both count as hits, but defer_lookup is set
-        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) is None
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2]), None, 2, _EMPTY_REQ_CTX)
+            is None
+        )
 
     def test_hit_pending_does_not_break_streak(self):
         """HIT_PENDING in the middle of a window doesn't reset the streak."""
@@ -4539,7 +4705,8 @@ class TestSlidingWindowLookup:
         )
         # window=3: right-to-left finds 3(HIT),2(HIT_PENDING),1(HIT) = 3 consecutive
         assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) is None
+            sched._sliding_window_lookup(to_keys([1, 2, 3]), None, 3, _EMPTY_REQ_CTX)
+            is None
         )
 
 
@@ -4606,7 +4773,9 @@ def test_swa_load_does_not_wait_for_unusable_pending_suffix(
     [(job_id, load)] = metadata.load_jobs.items()
     assert isinstance(load.dst_spec, GPULoadStoreSpec)
     assert load.dst_spec.group_sizes == [2, 2]
-    assert manager.lookup(swa[3], state.req_context) is LookupResult.HIT_PENDING
+    assert (
+        manager.lookup([swa[3]], None, state.req_context)[0] is LookupResult.HIT_PENDING
+    )
 
     runner.scheduler.update_from_output(
         output,
@@ -4621,7 +4790,9 @@ def test_swa_load_does_not_wait_for_unusable_pending_suffix(
     )
     resumed = runner.scheduler.schedule()
     assert resumed.num_scheduled_tokens == {"0": 9}
-    assert manager.lookup(swa[3], state.req_context) is LookupResult.HIT_PENDING
+    assert (
+        manager.lookup([swa[3]], None, state.req_context)[0] is LookupResult.HIT_PENDING
+    )
 
 
 @pytest.mark.parametrize("alignment_chunk_count", [4, 8, 64])
@@ -4647,12 +4818,13 @@ def test_sliding_window_demand_is_store_reachable(
         {i: LookupResult.HIT_PENDING for i in range(storable_chunk_count)}
     )
     sched._sliding_window_lookup(
-        to_keys(range(storable_chunk_count)), required_window, _EMPTY_REQ_CTX
+        to_keys(range(storable_chunk_count)), None, required_window, _EMPTY_REQ_CTX
     )
 
     demanded = {
-        int(get_offload_block_hash(lookup_call.args[0]).decode())
+        int(get_offload_block_hash(key).decode())
         for lookup_call in _as_mock(sched.manager.lookup).call_args_list
+        for key in lookup_call.args[0]
     }
     assert demanded, "the scan must query something"
 
@@ -4902,7 +5074,7 @@ def test_full_attention_pending_store_fence(async_scheduling, shared_prefix):
     block_id, block_hash = block.block_id, block.block_hash
     assert block_hash is not None
     scheduler.update_from_output(output, create_model_runner_output(scheduler.running))
-    assert manager.lookup(key, state.req_context) is LookupResult.HIT_PENDING
+    assert manager.lookup([key], None, state.req_context)[0] is LookupResult.HIT_PENDING
 
     scheduler.finish_requests(request_a.request_id, RequestStatus.FINISHED_STOPPED)
     output = scheduler.schedule()
@@ -4935,7 +5107,7 @@ def test_full_attention_pending_store_fence(async_scheduling, shared_prefix):
                 ),
             ),
         )
-        assert manager.lookup(key, state.req_context) is LookupResult.HIT
+        assert manager.lookup([key], None, state.req_context)[0] is LookupResult.HIT
     else:
         assert b_block.block_hash != block_hash
         assert jobs <= (metadata.jobs_to_flush or set())
@@ -5357,7 +5529,7 @@ def test_failed_load_ends_or_reruns_its_request(
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * (block_size * 3 + 1))
     request = runner.scheduler.requests[str(runner.req_id)]
-    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -5953,8 +6125,10 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool, extra_retain
     # Verify that loads still work correctly for the stored SWA blocks.
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * num_tokens + [1])
-    runner.manager.lookup.side_effect = lambda key, ctx: (
-        LookupResult.HIT if (key, 0) in runner.offloaded else LookupResult.MISS
+    runner.manager.lookup.side_effect = _as_batched(
+        lambda key, ctx: (
+            LookupResult.HIT if (key, 0) in runner.offloaded else LookupResult.MISS
+        )
     )
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
@@ -6012,10 +6186,11 @@ def _demanded_keys(runner, offload_keys_per_group: list[list], num_tokens: int) 
         if window is None:
             _maximal_lookup(scan, keys)
         else:
-            scan._sliding_window_lookup(keys, window, _EMPTY_REQ_CTX)
+            scan._sliding_window_lookup(keys, None, window, _EMPTY_REQ_CTX)
     return {
-        lookup_call.args[0]
+        key
         for lookup_call in _as_mock(scan.manager.lookup).call_args_list
+        for key in lookup_call.args[0]
     }
 
 
@@ -6072,7 +6247,7 @@ def test_request_level_supply_covers_consumer_demand(
     )
     if warmth == "primary_warm":
         # HIT is final; HIT_PENDING would defer the request on every step.
-        runner.manager.lookup.return_value = LookupResult.HIT
+        runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     runner.new_request(token_ids=[0] * num_tokens)
 
     offload_keys_per_group: list[list] = []
@@ -6342,7 +6517,9 @@ class TestEagle:
             block_hasher=get_request_block_hasher(block_size, sha256, num_lookahead),
         )
         connector.on_new_request(request)
-        _as_mock(connector.scheduler.manager).lookup.return_value = LookupResult.HIT
+        _as_mock(connector.scheduler.manager).lookup.side_effect = _lookup_all(
+            LookupResult.HIT
+        )
 
         assert connector.get_num_new_matched_tokens(request, 0) == (
             expected,
@@ -7182,7 +7359,7 @@ class TestMTPOffload:
         runner.scheduler.reset_prefix_cache()
 
         runner.new_request(token_ids=[0] * (block_size * 3 + 1))
-        runner.manager.lookup.return_value = LookupResult.HIT
+        runner.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
         runner.run(
             decoded_tokens=[EOS_TOKEN_ID],
             expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
@@ -7235,8 +7412,8 @@ class TestMambaHybridOffloadServing:
     def _roundtrip_served_tokens(self, scheduler) -> int:
         """Request A: prompt-only store, finish; request A2: served tokens."""
         stored: set = set()
-        _as_mock(scheduler.manager.lookup).side_effect = lambda key, ctx: (
-            LookupResult.HIT if key in stored else LookupResult.MISS
+        _as_mock(scheduler.manager.lookup).side_effect = _as_batched(
+            lambda key, ctx: LookupResult.HIT if key in stored else LookupResult.MISS
         )
         _as_mock(scheduler.manager.prepare_store).side_effect = (
             lambda keys, ctx, trigger: generate_store_output(list(keys))
@@ -7385,7 +7562,10 @@ def test_dcp_partial_tail_store_is_independent_of_handoff_batching(split_handoff
     assert pairs == [([12, 25], [1, 3])]
     context = scheduler._req_status[request.request_id].req_context
     earlier_attention_key = make_offload_key(request.block_hashes[11], 0)
-    assert scheduler.manager.lookup(earlier_attention_key, context) is LookupResult.MISS
+    assert (
+        scheduler.manager.lookup([earlier_attention_key], None, context)[0]
+        is LookupResult.MISS
+    )
 
 
 def _make_lookahead_hybrid_engine(lookahead=1):
@@ -7435,7 +7615,7 @@ def test_lookahead_partial_lookup_uses_available_hashes(lookahead):
         block_hasher=get_request_block_hasher(4, sha256, lookahead),
     )
     engine.add_request(request)
-    connector.scheduler.manager.lookup.return_value = LookupResult.HIT
+    connector.scheduler.manager.lookup.side_effect = _lookup_all(LookupResult.HIT)
     assert connector.get_num_new_matched_tokens(request, 0) == (
         min(40, len(request.block_hashes) * 4),
         True,

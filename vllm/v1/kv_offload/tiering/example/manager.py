@@ -9,7 +9,7 @@ TieringOffloadingManager without requiring actual storage or network backends.
 """
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -111,18 +111,28 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         return self._config_info.as_config_info()
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        """Check whether a chunk exists in this secondary tier.
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        """Check which chunks exist in this secondary tier.
 
         Args:
-            key: Offload key to look up.
+            keys: Offload keys to look up.
+            positions: Each key's end-token position, unused here.
             req_context: Per-request context.
 
         Returns:
-            HIT if the chunk is present, MISS if not found.
+            One result per key, in order: HIT if the chunk is present,
+            MISS if not found.
 
         """
-        return LookupResult.HIT if key in self.chunks else LookupResult.MISS
+        return [
+            LookupResult.HIT if key in self.chunks else LookupResult.MISS
+            for key in keys
+        ]
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:

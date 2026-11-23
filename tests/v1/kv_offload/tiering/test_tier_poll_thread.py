@@ -10,7 +10,7 @@ services such tiers between steps and the exclusion that makes it safe.
 
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from typing import ClassVar
 from unittest.mock import MagicMock
@@ -66,8 +66,13 @@ class _FakeTier(SecondaryTierManager):
         self.shutdown_saw_live_thread: bool | None = None
         self.on_serve = None
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return LookupResult.MISS
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        return [LookupResult.MISS] * len(keys)
 
     def submit_store(self, job_metadata: TransferJob) -> None:
         pass
@@ -298,7 +303,7 @@ class _LookingUpTier(_FakeTier):
     def _look_up(self, parent: ParentManager) -> None:
         self.in_serve = True
         try:
-            parent.lookup(OffloadKey(b"\x01" * 8), ReqContext(req_id="peer"))
+            parent.lookup([OffloadKey(b"\x01" * 8)], None, ReqContext(req_id="peer"))[0]
         finally:
             self.in_serve = False
 
@@ -344,7 +349,7 @@ def test_parent_lookup_while_serving_keeps_the_round_contained():
             assert quiet.polls == 0, "quiet tier was polled off-thread"
 
             # The next step's first lookup still does its poll.
-            manager.lookup(OffloadKey(b"\x02" * 8), _CTX)
+            manager.lookup([OffloadKey(b"\x02" * 8)], None, _CTX)[0]
             assert quiet.polls == 1
     finally:
         manager.shutdown()
@@ -355,8 +360,13 @@ class _HitTier(_FakeTier):
 
     tolerates_off_thread_polling: ClassVar[bool] = False
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return LookupResult.HIT
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        return [LookupResult.HIT] * len(keys)
 
 
 class _PromotingTier(_FakeTier):
@@ -373,7 +383,7 @@ class _PromotingTier(_FakeTier):
         self.promoted = threading.Event()
 
     def _promote(self, parent: ParentManager) -> None:
-        parent.lookup(OffloadKey(b"\x07" * 8), ReqContext(req_id="peer"))
+        parent.lookup([OffloadKey(b"\x07" * 8)], None, ReqContext(req_id="peer"))[0]
         self.promoted.set()
 
 

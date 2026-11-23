@@ -40,7 +40,7 @@ mark_present()).
 import queue
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -143,28 +143,37 @@ class AsyncLookupManager(ABC):
     # Scheduler-thread API
     # ------------------------------------------------------------------
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
+    def lookup(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> list[bool | None]:
         """Non-blocking lookup called from the scheduler thread.
 
+        New keys join this step's probe batch; known keys return their
+        cached verdict. Each key gets the requesting context in its batch
+        entry, so all keys of one call share the calling request's context.
+
         Returns:
-            True  — block is present in this tier.
-            False — block is not present in this tier.
-            None  — result not yet available; retry next step.
+            One result per key, in order: True if the block is present in
+            this tier, False if it is not, None while its probe is
+            outstanding (retry next step).
 
         """
         if self._need_to_drain:
             self.drain_results()
             self._need_to_drain = False
         req_id = req_context.req_id
-        state = self._lookup_state.get(key)
-        if state is None:
-            state = LookupState(generation=self._next_generation)
-            self._next_generation += 1
-            self._lookup_state[key] = state
-            self._lookup_batch.append((key, req_context, state.generation))
-        state.request_ids.add(req_id)
-        self._req_keys.setdefault(req_id, set()).add(key)
-        return state.result
+        results: list[bool | None] = []
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is None:
+                state = LookupState(generation=self._next_generation)
+                self._next_generation += 1
+                self._lookup_state[key] = state
+                self._lookup_batch.append((key, req_context, state.generation))
+            state.request_ids.add(req_id)
+            self._req_keys.setdefault(req_id, set()).add(key)
+            results.append(state.result)
+        return results
 
     def flush(self) -> None:
         """Post this step's accumulated keys to the worker thread.

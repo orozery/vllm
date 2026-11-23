@@ -262,8 +262,15 @@ class _SecondaryTierFacingParent(ParentManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return self._m.on_new_request(req_context, exclude_tier_idx=self._origin_idx)
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return self._m.lookup(key, req_context, exclude_tier_idx=self._origin_idx)
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        return self._m.lookup(
+            keys, positions, req_context, exclude_tier_idx=self._origin_idx
+        )
 
     def create_store_job(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -719,29 +726,41 @@ class TieringOffloadingManager(OffloadingManager):
     @override
     def lookup(
         self,
-        key: OffloadKey,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
         req_context: ReqContext,
         *,
         exclude_tier_idx: int | None = None,
-    ) -> LookupResult:
-        """Check whether a single chunk is offloaded and ready.
+    ) -> Sequence[LookupResult]:
+        """Check which of `keys` are offloaded and ready.
 
-        Algorithm:
-            1. Process any completed async jobs first.
-            2. Query primary tier — short-circuit on hit or in-flight.
-            3. On primary miss, query secondary tiers — stop on first
-               hit and initiate promotion.
+        Algorithm, in two passes:
+            1. Process any completed async jobs once for the whole slice.
+            2. Query the primary tier for every key — short-circuit on hit or
+               in-flight.
+            3. Query each permitted secondary tier once, for the keys still
+               unresolved, in tier order — stop on the first hit and initiate
+               a promotion.
+
+        The whole slice is probed, so a caller that stops scanning at a miss
+        still has the keys past it probed. Until #66782 moves promotion out of
+        lookup, that can promote keys the caller does not load; the answers
+        themselves are unchanged.
 
         Args:
-            key: Chunk hash to look up.
+            keys: Chunk hashes to look up.
+            positions: Each key's end-token position, parallel to `keys`, or
+                None when the caller tracks none.
             req_context: Per-request context.
             exclude_tier_idx: Skip this tier index during the lookup.
 
         Returns:
+            One result per key, in order:
             HIT       — chunk is ready in the primary tier.
             HIT_PENDING — chunk found but not yet readable (write
                         in-flight on the primary tier).
-            RETRY     — promotion started or a secondary tier is busy.
+            RETRY     — a secondary tier is busy. A promotion this call
+                        started reports HIT_PENDING, not RETRY.
             MISS      — chunk not found in any tier, primary is full
                         and cannot accept a promotion, or promotions are
                         held after a cache reset (see reset_cache()).
@@ -753,25 +772,39 @@ class TieringOffloadingManager(OffloadingManager):
         # in time for a promotion this lookup may initiate.
         self._maybe_process_finished_jobs()
 
-        start_time = time.monotonic()
-        primary_hit = self.primary_tier.lookup(key, req_context)
-        lookup_duration = time.monotonic() - start_time
-        self._metrics.on_lookup(
-            req_context,
-            key,
-            self._metrics.primary_tier_label,
-            primary_hit,
-            lookup_duration,
-        )
-        if primary_hit is LookupResult.HIT:
-            return LookupResult.HIT
-        if primary_hit is LookupResult.HIT_PENDING:
-            return LookupResult.HIT_PENDING
-        if self._promotions_held:
-            return LookupResult.MISS
+        results: list[LookupResult | None] = [None] * len(keys)
+        unresolved: list[int] = []
 
-        any_retry = False
+        primary_label = self._metrics.primary_tier_label
+        start_time = time.monotonic()
+        primary_results = self.primary_tier.lookup(keys, positions, req_context)
+        assert len(primary_results) == len(keys)
+        primary_duration = time.monotonic() - start_time
+        # One batched probe is amortized across its keys, so the summed
+        # per-key delays match per-key probing.
+        per_key_duration = primary_duration / max(1, len(keys))
+        for idx, result in enumerate(primary_results):
+            self._metrics.on_lookup(
+                req_context,
+                keys[idx],
+                primary_label,
+                result,
+                per_key_duration,
+            )
+            if result is LookupResult.HIT or result is LookupResult.HIT_PENDING:
+                results[idx] = result
+            else:
+                unresolved.append(idx)
+
+        if unresolved and self._promotions_held:
+            for idx in unresolved:
+                results[idx] = LookupResult.MISS
+            unresolved = []
+
+        retried: set[int] = set()
         for i, tier in enumerate(self.secondary_tiers):
+            if not unresolved:
+                break
             if i == exclude_tier_idx:
                 continue
             if not tier.access_mode.can_read:
@@ -779,33 +812,42 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
                 continue
+            tier_keys = [keys[idx] for idx in unresolved]
+            tier_positions = (
+                None if positions is None else [positions[idx] for idx in unresolved]
+            )
             labelvalues = self._metrics.tier_label(i)
             start_time = time.monotonic()
-            result = tier.lookup(key, req_context)
-            lookup_duration = time.monotonic() - start_time
-            if result is LookupResult.HIT:
+            tier_results = tier.lookup(tier_keys, tier_positions, req_context)
+            assert len(tier_results) == len(unresolved)
+            per_key_duration = (time.monotonic() - start_time) / max(1, len(unresolved))
+            still_unresolved: list[int] = []
+            for idx, result in zip(unresolved, tier_results):
                 self._metrics.on_lookup(
                     req_context,
-                    key,
+                    keys[idx],
                     labelvalues,
                     result,
-                    lookup_duration,
+                    per_key_duration,
                 )
-                promoted = self._initiate_promotion(i, key, req_context)
-                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
-            if result is LookupResult.RETRY:
-                any_retry = True
-            self._metrics.on_lookup(
-                req_context,
-                key,
-                labelvalues,
-                result,
-                lookup_duration,
-            )
+                if result is LookupResult.HIT:
+                    promoted = self._initiate_promotion(i, keys[idx], req_context)
+                    results[idx] = (
+                        LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+                    )
+                else:
+                    if result is LookupResult.RETRY:
+                        retried.add(idx)
+                    still_unresolved.append(idx)
+            unresolved = still_unresolved
 
-        if any_retry:
-            return LookupResult.RETRY
-        return LookupResult.MISS
+        for idx in unresolved:
+            results[idx] = LookupResult.RETRY if idx in retried else LookupResult.MISS
+        out: list[LookupResult] = []
+        for value in results:
+            assert value is not None, "lookup left a key unresolved"
+            out.append(value)
+        return out
 
     @override
     def get_load_source(
@@ -1026,8 +1068,7 @@ class TieringOffloadingManager(OffloadingManager):
         """
         state = self._req_state[req_context.req_id]
         ready_keys = []
-        for key in keys:
-            result = self.primary_tier.lookup(key, req_context)
+        for key, result in zip(keys, self.primary_tier.lookup(keys, None, req_context)):
             if result is LookupResult.HIT:
                 ready_keys.append(key)
             elif result is LookupResult.HIT_PENDING:

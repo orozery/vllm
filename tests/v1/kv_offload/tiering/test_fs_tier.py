@@ -136,14 +136,14 @@ def lookup_and_wait(
 ) -> list[LookupResult]:
     """Perform a full async lookup cycle and return resolved results."""
     for k in keys:
-        tier.lookup(k, ctx)
+        tier.lookup([k], None, ctx)[0]
     tier.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not tier._lookup_manager._pending_results.empty():
             break
         time.sleep(0.01)
-    return [tier.lookup(k, ctx) for k in keys]
+    return [tier.lookup([k], None, ctx)[0] for k in keys]
 
 
 def _page_aligned_zero_tensor(
@@ -861,7 +861,7 @@ def test_failed_load_corrects_verdict_and_removes_corrupt_file(
     tier.submit_load(make_job(2, [key(1)], [0], is_promotion=True))
     results = drain(tier)
     assert len(results) == 1 and results[0].success
-    assert tier.lookup(key(1), ctx) == LookupResult.HIT
+    assert tier.lookup([key(1)], None, ctx)[0] == LookupResult.HIT
     assert os.path.exists(path)
 
     # Truncate below block_size so the next promotion short-reads.
@@ -874,7 +874,7 @@ def test_failed_load_corrects_verdict_and_removes_corrupt_file(
     # Corrupt file removed; the SAME request now misses from cache, no re-probe.
     assert not os.path.exists(path)
     lm = tier._lookup_manager
-    assert tier.lookup(key(1), ctx) == LookupResult.MISS
+    assert tier.lookup([key(1)], None, ctx)[0] == LookupResult.MISS
     assert lm._lookup_batch == []
 
     # A FRESH request re-probes the tier (no cached verdict) and misses too,
@@ -899,7 +899,7 @@ def test_failed_load_after_abort_does_not_break_newer_probe(fs_tier):
     tier.submit_load(make_job(2, [k], [1], is_promotion=True))
     tier.on_request_finished(ctx_a)
 
-    assert tier.lookup(k, ctx_b) == LookupResult.RETRY
+    assert tier.lookup([k], None, ctx_b)[0] == LookupResult.RETRY
     tier.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
     deadline = time.monotonic() + 1.0
     while tier._lookup_manager._pending_results.empty():
@@ -907,7 +907,7 @@ def test_failed_load_after_abort_does_not_break_newer_probe(fs_tier):
         time.sleep(0.01)
 
     assert [r.success for r in drain(tier)] == [False]
-    assert tier.lookup(k, ctx_b) == LookupResult.MISS
+    assert tier.lookup([k], None, ctx_b)[0] == LookupResult.MISS
 
 
 @pytest.mark.parametrize("use_c_ext", [True, False])
@@ -946,7 +946,7 @@ def test_batched_partial_load_failure_keeps_loaded_blocks(
     # (b) Only the failed tail is a miss; the loaded blocks stay HIT on the same
     # request, and nothing was re-probed.
     lm = tier._lookup_manager
-    assert [tier.lookup(k, ctx) for k in keys] == [
+    assert [tier.lookup([k], None, ctx)[0] for k in keys] == [
         LookupResult.HIT,
         LookupResult.HIT,
         LookupResult.MISS,
@@ -993,7 +993,7 @@ def test_batched_load_first_block_fails_marks_whole_batch(
     # Nothing loaded before the failure -> no partial success reported.
     assert results[0].successful_keys is None
     # The whole batch is a miss for this request.
-    assert [tier.lookup(k, ctx) for k in keys] == [LookupResult.MISS] * 3
+    assert [tier.lookup([k], None, ctx)[0] for k in keys] == [LookupResult.MISS] * 3
 
 
 @pytest.mark.parametrize("use_c_ext", [True, False])

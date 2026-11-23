@@ -65,46 +65,46 @@ class TestAsyncLookupManager:
         healthy_ctx = _ctx("healthy")
         later_ctx = _ctx("later")
         try:
-            assert mgr.lookup(_key(1), failing_ctx) is None
-            assert mgr.lookup(_key(2), failing_ctx) is None
-            assert mgr.lookup(_key(3), healthy_ctx) is None
+            assert mgr.lookup([_key(1)], failing_ctx)[0] is None
+            assert mgr.lookup([_key(2)], failing_ctx)[0] is None
+            assert mgr.lookup([_key(3)], healthy_ctx)[0] is None
             mgr.flush()
 
-            assert mgr.lookup(_key(4), later_ctx) is None
+            assert mgr.lookup([_key(4)], later_ctx)[0] is None
             mgr.flush()
         finally:
             # The FIFO shutdown sentinel waits for both batches and drains results.
             mgr.shutdown()
 
-        assert mgr.lookup(_key(1), failing_ctx) is False
-        assert mgr.lookup(_key(2), failing_ctx) is False
-        assert mgr.lookup(_key(3), healthy_ctx) is True
-        assert mgr.lookup(_key(4), later_ctx) is True
+        assert mgr.lookup([_key(1)], failing_ctx)[0] is False
+        assert mgr.lookup([_key(2)], failing_ctx)[0] is False
+        assert mgr.lookup([_key(3)], healthy_ctx)[0] is True
+        assert mgr.lookup([_key(4)], later_ctx)[0] is True
 
     def test_new_key_returns_none(self):
         mgr = InMemoryLookupManager()
-        assert mgr.lookup(_key(1), _ctx()) is None
+        assert mgr.lookup([_key(1)], _ctx())[0] is None
         mgr.shutdown()
 
     def test_found_key_returns_true(self):
         mgr = InMemoryLookupManager(existing_keys={_key(1)})
-        assert mgr.lookup(_key(1), _ctx()) is None
+        assert mgr.lookup([_key(1)], _ctx())[0] is None
         assert mgr._lookup_state[_key(1)].phase is LookupPhase.PENDING
         mgr.flush()
         assert mgr._lookup_state[_key(1)].phase is LookupPhase.IN_FLIGHT
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        assert mgr.lookup(_key(1), _ctx()) is True
+        assert mgr.lookup([_key(1)], _ctx())[0] is True
         assert mgr._lookup_state[_key(1)].phase is LookupPhase.RESOLVED
         mgr.shutdown()
 
     def test_not_found_key_returns_false(self):
         mgr = InMemoryLookupManager(existing_keys=set())
-        assert mgr.lookup(_key(1), _ctx()) is None
+        assert mgr.lookup([_key(1)], _ctx())[0] is None
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        assert mgr.lookup(_key(1), _ctx()) is False
+        assert mgr.lookup([_key(1)], _ctx())[0] is False
         mgr.shutdown()
 
     def test_multiple_keys_single_step(self):
@@ -112,14 +112,14 @@ class TestAsyncLookupManager:
         mgr = InMemoryLookupManager(existing_keys=existing)
         ctx = _ctx()
         for i in range(1, 5):
-            assert mgr.lookup(_key(i), ctx) is None
+            assert mgr.lookup([_key(i)], ctx)[0] is None
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        assert mgr.lookup(_key(1), ctx) is True
-        assert mgr.lookup(_key(2), ctx) is False
-        assert mgr.lookup(_key(3), ctx) is True
-        assert mgr.lookup(_key(4), ctx) is False
+        assert mgr.lookup([_key(1)], ctx)[0] is True
+        assert mgr.lookup([_key(2)], ctx)[0] is False
+        assert mgr.lookup([_key(3)], ctx)[0] is True
+        assert mgr.lookup([_key(4)], ctx)[0] is False
         mgr.shutdown()
 
     def test_publishes_completed_group_before_next_group_finishes(
@@ -146,14 +146,14 @@ class TestAsyncLookupManager:
 
         monkeypatch.setattr(mgr, "batch_lookup", blocking_lookup)
         try:
-            assert mgr.lookup(key_a, ctx_a) is None
-            assert mgr.lookup(key_b, ctx_b) is None
+            assert mgr.lookup([key_a], ctx_a)[0] is None
+            assert mgr.lookup([key_b], ctx_b)[0] is None
             mgr.flush()
             assert group_b_started.wait(timeout=5)
             assert groups_started == [ctx_a.req_id, ctx_b.req_id]
 
-            assert mgr.lookup(key_a, ctx_a) is True
-            assert mgr.lookup(key_b, ctx_b) is None
+            assert mgr.lookup([key_a], ctx_a)[0] is True
+            assert mgr.lookup([key_b], ctx_b)[0] is None
             assert mgr._lookup_state[key_b].phase is LookupPhase.IN_FLIGHT
             assert mgr._pending_results.empty()
 
@@ -161,7 +161,7 @@ class TestAsyncLookupManager:
             group_b_results = mgr._pending_results.get(timeout=5)
             mgr._pending_results.put(group_b_results)
             mgr.flush()
-            assert mgr.lookup(key_b, ctx_b) is False
+            assert mgr.lookup([key_b], ctx_b)[0] is False
         finally:
             release_group_b.set()
             mgr.shutdown()
@@ -191,8 +191,8 @@ class TestAsyncLookupManager:
 
         monkeypatch.setattr(mgr, "batch_lookup", lazy_lookup)
         try:
-            assert mgr.lookup(key_a, ctx) is None
-            assert mgr.lookup(key_b, ctx) is None
+            assert mgr.lookup([key_a], ctx)[0] is None
+            assert mgr.lookup([key_b], ctx)[0] is None
             mgr.flush()
             assert iterator_started.wait(timeout=5)
             assert mgr._pending_results.empty()
@@ -205,8 +205,8 @@ class TestAsyncLookupManager:
             ]
             mgr._pending_results.put(group_results)
             mgr.drain_results()
-            assert mgr.lookup(key_a, ctx) is True
-            assert mgr.lookup(key_b, ctx) is False
+            assert mgr.lookup([key_a], ctx)[0] is True
+            assert mgr.lookup([key_b], ctx)[0] is False
         finally:
             release_iterator.set()
             mgr.shutdown()
@@ -214,11 +214,11 @@ class TestAsyncLookupManager:
     def test_cleanup_removes_entries(self):
         mgr = InMemoryLookupManager(existing_keys={_key(1)})
         ctx = _ctx("req_a")
-        mgr.lookup(_key(1), ctx)
+        mgr.lookup([_key(1)], ctx)[0]
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        assert mgr.lookup(_key(1), ctx) is True
+        assert mgr.lookup([_key(1)], ctx)[0] is True
         mgr.cleanup("req_a")
         assert _key(1) not in mgr._lookup_state
         mgr.shutdown()
@@ -227,13 +227,13 @@ class TestAsyncLookupManager:
         mgr = InMemoryLookupManager(existing_keys={_key(1)})
         ctx_a = _ctx("req_a")
         ctx_b = _ctx("req_b")
-        mgr.lookup(_key(1), ctx_a)
-        mgr.lookup(_key(1), ctx_b)
+        mgr.lookup([_key(1)], ctx_a)[0]
+        mgr.lookup([_key(1)], ctx_b)[0]
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
         # Drain so result is applied
-        mgr.lookup(_key(1), ctx_a)
+        mgr.lookup([_key(1)], ctx_a)[0]
         mgr.cleanup("req_a")
         # Key still present because req_b still references it
         assert _key(1) in mgr._lookup_state
@@ -258,19 +258,19 @@ class TestAsyncLookupManager:
 
         monkeypatch.setattr(mgr, "batch_lookup", blocking_lookup)
         try:
-            assert mgr.lookup(key, _ctx("req_a")) is None
+            assert mgr.lookup([key], _ctx("req_a"))[0] is None
             mgr.flush()
             assert probe_started.wait(timeout=5)
             assert mgr._lookup_state[key].phase is LookupPhase.IN_FLIGHT
             mgr.cleanup("req_a")
-            assert mgr.lookup(key, ctx_b) is None
+            assert mgr.lookup([key], ctx_b)[0] is None
             assert mgr._lookup_state[key].phase is LookupPhase.IN_FLIGHT
             mgr.flush()
 
             release_probe.set()
             batch = mgr._pending_results.get(timeout=5)
             mgr._pending_results.put(batch)
-            replacement_result = mgr.lookup(key, ctx_b)
+            replacement_result = mgr.lookup([key], ctx_b)[0]
         finally:
             release_probe.set()
             mgr.shutdown()
@@ -286,7 +286,7 @@ class TestAsyncLookupManager:
         key = _key(1)
         mgr = InMemoryLookupManager(existing_keys={key})
         try:
-            mgr.lookup(key, _ctx("req_a"))
+            mgr.lookup([key], _ctx("req_a"))[0]
             mgr.flush()
             mgr.cleanup("req_a")
             assert key in mgr._lookup_state
@@ -308,11 +308,11 @@ class TestAsyncLookupManager:
         mgr = InMemoryLookupManager()
         ctx_a = _ctx("req_a")
         ctx_b = _ctx("req_b")
-        assert mgr.lookup(key, ctx_a) is None
+        assert mgr.lookup([key], ctx_a)[0] is None
         stale_generation = mgr._lookup_state[key].generation
         mgr.cleanup("req_a")
 
-        assert mgr.lookup(key, ctx_b) is None
+        assert mgr.lookup([key], ctx_b)[0] is None
         generation = mgr._lookup_state[key].generation
         assert generation != stale_generation
 
@@ -323,7 +323,7 @@ class TestAsyncLookupManager:
         mgr._pending_results.put([(key, stale_generation, True)])
         mgr._pending_results.put(current_result)
         mgr.drain_results()
-        assert mgr.lookup(key, ctx_b) is False
+        assert mgr.lookup([key], ctx_b)[0] is False
         mgr.shutdown()
 
     def test_flush_no_queue_post_when_empty(self):
@@ -334,7 +334,7 @@ class TestAsyncLookupManager:
 
     def test_flush_skips_lookup_cleaned_up_before_submit(self):
         mgr = InMemoryLookupManager()
-        mgr.lookup(_key(1), _ctx("req_a"))
+        mgr.lookup([_key(1)], _ctx("req_a"))[0]
         mgr.cleanup("req_a")
         mgr.flush()
         mgr.shutdown()
@@ -344,19 +344,19 @@ class TestAsyncLookupManager:
     def test_repeated_lookup_same_key_no_duplicate_batch(self):
         mgr = InMemoryLookupManager(existing_keys={_key(1)})
         ctx = _ctx()
-        mgr.lookup(_key(1), ctx)
-        mgr.lookup(_key(1), ctx)
+        mgr.lookup([_key(1)], ctx)[0]
+        mgr.lookup([_key(1)], ctx)[0]
         assert len(mgr._lookup_batch) == 1
         mgr.shutdown()
 
     def test_cleanup_unknown_req_id_is_noop(self):
         mgr = InMemoryLookupManager(existing_keys={_key(1)})
         ctx = _ctx("req_a")
-        mgr.lookup(_key(1), ctx)
+        mgr.lookup([_key(1)], ctx)[0]
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        mgr.lookup(_key(1), ctx)
+        mgr.lookup([_key(1)], ctx)[0]
         mgr.cleanup("nonexistent")
         assert _key(1) in mgr._lookup_state
         mgr.shutdown()
@@ -367,22 +367,22 @@ class TestAsyncLookupManager:
         ctx = _ctx()
 
         # Step 1: lookup key 1, flush
-        mgr.lookup(_key(1), ctx)
+        mgr.lookup([_key(1)], ctx)[0]
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
 
         # Step 2: lookup keys 2 and 3, flush
-        mgr.lookup(_key(2), ctx)
-        mgr.lookup(_key(3), ctx)
+        mgr.lookup([_key(2)], ctx)[0]
+        mgr.lookup([_key(3)], ctx)[0]
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
 
         # All results should be available
-        assert mgr.lookup(_key(1), ctx) is True
-        assert mgr.lookup(_key(2), ctx) is True
-        assert mgr.lookup(_key(3), ctx) is True
+        assert mgr.lookup([_key(1)], ctx)[0] is True
+        assert mgr.lookup([_key(2)], ctx)[0] is True
+        assert mgr.lookup([_key(3)], ctx)[0] is True
         mgr.shutdown()
 
     def test_shutdown_unblocks_worker(self):
@@ -399,12 +399,12 @@ class TestAsyncLookupManager:
         index stays consistent; an unknown key is a no-op."""
         mgr = InMemoryLookupManager(existing_keys={_key(1), _key(2)})
         ctx = _ctx("reqA")
-        assert mgr.lookup(_key(1), ctx) is None
-        mgr.lookup(_key(2), ctx)
+        assert mgr.lookup([_key(1)], ctx)[0] is None
+        mgr.lookup([_key(2)], ctx)[0]
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        assert mgr.lookup(_key(1), ctx) is True
+        assert mgr.lookup([_key(1)], ctx)[0] is True
 
         # An unknown key must not raise or plant an entry.
         mgr.mark_miss([_key(99)])
@@ -414,11 +414,11 @@ class TestAsyncLookupManager:
         # wrongly return True again — the verdict must be served from cache as
         # False, with no re-probe enqueued, and stay False across steps.
         mgr.mark_miss([_key(1)])
-        assert mgr.lookup(_key(1), ctx) is False
+        assert mgr.lookup([_key(1)], ctx)[0] is False
         assert mgr._lookup_batch == []  # no fresh probe enqueued
         mgr.flush()
         assert mgr._lookup_queue.empty()  # nothing posted to the worker
-        assert mgr.lookup(_key(1), ctx) is False
+        assert mgr.lookup([_key(1)], ctx)[0] is False
 
         # Entry retained (now False) with reverse index intact, so cleanup()
         # (which direct-indexes _lookup_state per reverse-index key) tears down
@@ -441,15 +441,15 @@ class TestAsyncLookupManager:
         drain_results() assert on the scheduler thread."""
         mgr = InMemoryLookupManager(existing_keys={_key(1)})
         try:
-            assert mgr.lookup(_key(1), _ctx("A")) is None
+            assert mgr.lookup([_key(1)], _ctx("A"))[0] is None
             mgr.flush()
             mgr._results_ready.wait()
             mgr._results_ready.clear()
-            assert mgr.lookup(_key(1), _ctx("A")) is True
+            assert mgr.lookup([_key(1)], _ctx("A"))[0] is True
             mgr.cleanup("A")
             assert _key(1) not in mgr._lookup_state
 
-            assert mgr.lookup(_key(1), _ctx("B")) is None
+            assert mgr.lookup([_key(1)], _ctx("B"))[0] is None
             if flushed:
                 mgr.flush()
                 mgr._results_ready.wait()
@@ -463,7 +463,7 @@ class TestAsyncLookupManager:
                 mgr._results_ready.wait()
                 mgr._results_ready.clear()
             # B's own probe result is delivered.
-            assert mgr.lookup(_key(1), _ctx("B")) is True
+            assert mgr.lookup([_key(1)], _ctx("B"))[0] is True
         finally:
             mgr.shutdown()
 
@@ -478,11 +478,11 @@ class TestAsyncLookupManager:
 
         # (a) Normal operation: the key is enqueued once and resolved once, with
         # no second result left pending.
-        assert mgr.lookup(_key(1), ctx) is None
+        assert mgr.lookup([_key(1)], ctx)[0] is None
         mgr.flush()
         mgr._results_ready.wait()
         mgr._results_ready.clear()
-        assert mgr.lookup(_key(1), ctx) is True  # decided exactly once
+        assert mgr.lookup([_key(1)], ctx)[0] is True  # decided exactly once
         assert mgr._pending_results.empty()
 
         # (b) A stray/duplicate result for the now-decided key violates the
@@ -512,7 +512,7 @@ class TestAsyncLookupManager:
 
         monkeypatch.setattr(mgr, "batch_lookup", blocking_lookup)
         try:
-            assert mgr.lookup(key, _ctx("req_a")) is None
+            assert mgr.lookup([key], _ctx("req_a"))[0] is None
             mgr.flush()
             assert probe_started.wait(timeout=5)
             mgr.cleanup("req_a")
@@ -556,19 +556,19 @@ class TestAsyncLookupManager:
         monkeypatch.setattr(mgr, "batch_lookup", blocking_lookup)
         try:
             # Resolved: a probe delivered a miss.
-            assert mgr.lookup(resolved_key, _ctx("req_c")) is None
+            assert mgr.lookup([resolved_key], _ctx("req_c"))[0] is None
             mgr.flush()
             assert mgr._results_ready.wait(timeout=5)
             mgr._results_ready.clear()
-            assert mgr.lookup(resolved_key, _ctx("req_c")) is False
+            assert mgr.lookup([resolved_key], _ctx("req_c"))[0] is False
 
             # In flight: the worker is still inside this probe.
-            assert mgr.lookup(in_flight_key, _ctx("req_b")) is None
+            assert mgr.lookup([in_flight_key], _ctx("req_b"))[0] is None
             mgr.flush()
             assert probe_started.wait(timeout=5)
 
             # Pending: accumulated this step, not flushed yet.
-            assert mgr.lookup(pending_key, _ctx("req_a")) is None
+            assert mgr.lookup([pending_key], _ctx("req_a"))[0] is None
 
             mgr.mark_present([pending_key, in_flight_key, resolved_key, unknown_key])
 
@@ -581,10 +581,10 @@ class TestAsyncLookupManager:
             # A stale pending entry is skipped when its batch is flushed.
             mgr.flush()
 
-            assert mgr.lookup(pending_key, _ctx("req_a")) is True
-            assert mgr.lookup(in_flight_key, _ctx("req_b")) is True
-            assert mgr.lookup(resolved_key, _ctx("req_c")) is True
-            assert mgr.lookup(unknown_key, _ctx("req_d")) is None
+            assert mgr.lookup([pending_key], _ctx("req_a"))[0] is True
+            assert mgr.lookup([in_flight_key], _ctx("req_b"))[0] is True
+            assert mgr.lookup([resolved_key], _ctx("req_c"))[0] is True
+            assert mgr.lookup([unknown_key], _ctx("req_d"))[0] is None
 
             release_probe.set()
         finally:

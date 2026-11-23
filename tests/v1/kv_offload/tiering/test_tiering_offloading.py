@@ -13,7 +13,7 @@ These tests verify:
 import os
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import cast
 from unittest.mock import MagicMock, patch
 
@@ -91,7 +91,7 @@ def count_hits(manager, keys: list[OffloadKey]) -> int | None:
     """
     count = 0
     for key in keys:
-        result = manager.lookup(key, _CTX)
+        result = manager.lookup([key], None, _CTX)[0]
         if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
             return None
         if result is not LookupResult.HIT:
@@ -140,8 +140,13 @@ class MetricsSecondaryTierManager(SecondaryTierManager):
         self.submitted_loads: list[TransferJob] = []
         self.submitted_stores: list[TransferJob] = []
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return self.lookup_result
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        return [self.lookup_result] * len(keys)
 
     def submit_store(self, job_metadata: TransferJob) -> None:
         self.submitted_stores.append(job_metadata)
@@ -256,18 +261,18 @@ class TestExampleSecondaryTierManager:
 
         # Initially empty
         chunks = to_keys(range(3))
-        assert tier.lookup(chunks[0], _CTX) is LookupResult.MISS
+        assert tier.lookup([chunks[0]], None, _CTX)[0] is LookupResult.MISS
 
         # Store chunks (simulate with direct insertion for testing)
         tier.chunks[chunks[0]] = True
         tier.chunks[chunks[1]] = True
 
         # Lookup should find first two chunks
-        assert tier.lookup(chunks[0], _CTX) is LookupResult.HIT
-        assert tier.lookup(chunks[1], _CTX) is LookupResult.HIT
+        assert tier.lookup([chunks[0]], None, _CTX)[0] is LookupResult.HIT
+        assert tier.lookup([chunks[1]], None, _CTX)[0] is LookupResult.HIT
 
         # Third chunk not present
-        assert tier.lookup(chunks[2], _CTX) is LookupResult.MISS
+        assert tier.lookup([chunks[2]], None, _CTX)[0] is LookupResult.MISS
 
     def test_config_info_keys_match_the_filled_values(self):
         """A name the declaration misses becomes a dropped label at runtime."""
@@ -425,6 +430,66 @@ class TestTieringOffloadingManager:
             self.manager._process_finished_jobs()
         completed.assert_called_once_with(to_keys([1]), _CTX, True)
 
+    def test_lookup_is_two_pass_and_batched(self, manager_setup):
+        """The primary sees the whole slice once; each tier sees only misses."""
+        calls: list[tuple[str, list, list | None]] = []
+        primary_lookup = self.primary_tier.lookup
+        tier1_lookup = self.secondary_tier1.lookup
+        tier2_lookup = self.secondary_tier2.lookup
+
+        def record(name, lookup):
+            def batched(keys, positions, req_context):
+                calls.append(
+                    (
+                        name,
+                        list(keys),
+                        None if positions is None else list(positions),
+                    )
+                )
+                return lookup(keys, positions, req_context)
+
+            return batched
+
+        self._start_request()
+        # Chunk 1 resides in the primary; chunk 2 only in the second tier.
+        self.primary_tier.prepare_store(
+            to_keys([1]), _CTX, trigger=StoreTrigger.ON_COMPUTE
+        )
+        self.primary_tier.complete_store(
+            to_keys([1]), _CTX, trigger=StoreTrigger.ON_COMPUTE
+        )
+        self.secondary_tier2.chunks[to_keys([2])[0]] = True
+
+        with (
+            patch.object(
+                self.primary_tier,
+                "lookup",
+                side_effect=record("primary", primary_lookup),
+            ),
+            patch.object(
+                self.secondary_tier1,
+                "lookup",
+                side_effect=record("tier1", tier1_lookup),
+            ),
+            patch.object(
+                self.secondary_tier2,
+                "lookup",
+                side_effect=record("tier2", tier2_lookup),
+            ),
+        ):
+            results = self.manager.lookup(to_keys([1, 2, 3]), [16, 32, 48], _CTX)
+
+        assert list(results) == [
+            LookupResult.HIT,
+            LookupResult.HIT_PENDING,
+            LookupResult.MISS,
+        ]
+        assert calls == [
+            ("primary", to_keys([1, 2, 3]), [16, 32, 48]),
+            ("tier1", to_keys([2, 3]), [32, 48]),
+            ("tier2", to_keys([2, 3]), [32, 48]),
+        ]
+
     def test_take_events_aggregates_tier_owned_events(self, manager_setup, monkeypatch):
         primary_event = OffloadingEvent(to_keys([1]), Medium.CPU, removed=False)
         secondary_event1 = OffloadingEvent(to_keys([2]), Medium.STORAGE, removed=False)
@@ -497,10 +562,12 @@ class TestTieringOffloadingManager:
 
         # Verify chunks are present
         assert all(
-            self.secondary_tier1.lookup(c, _CTX) is LookupResult.HIT for c in chunks
+            self.secondary_tier1.lookup([c], None, _CTX)[0] is LookupResult.HIT
+            for c in chunks
         )
         assert all(
-            self.secondary_tier2.lookup(c, _CTX) is LookupResult.HIT for c in chunks
+            self.secondary_tier2.lookup([c], None, _CTX)[0] is LookupResult.HIT
+            for c in chunks
         )
 
     def test_read_only_tier_is_never_stored_to(self, manager_setup, monkeypatch):
@@ -539,7 +606,7 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(self.secondary_tier1, "lookup", tier1_lookup)
 
         self._start_request()
-        result = self.manager.lookup(chunk, _CTX)
+        result = self.manager.lookup([chunk], None, _CTX)[0]
 
         tier1_lookup.assert_not_called()
         assert result is LookupResult.MISS
@@ -634,7 +701,7 @@ class TestTieringOffloadingManager:
 
         # Lookup each chunk to initiate promotion for all of them
         for chunk in chunks:
-            result = self.manager.lookup(chunk, _CTX)
+            result = self.manager.lookup([chunk], None, _CTX)[0]
             assert result is LookupResult.HIT_PENDING  # promotion initiated
 
         # End of step 1: flushes deferred submit_load() calls
@@ -669,7 +736,7 @@ class TestTieringOffloadingManager:
         later_context = ReqContext(req_id="later")
         self.manager.on_new_request(later_context)
         assert all(
-            self.manager.lookup(chunk, later_context) is LookupResult.HIT
+            self.manager.lookup([chunk], None, later_context)[0] is LookupResult.HIT
             for chunk in chunks
         )
         assert all(
@@ -720,13 +787,15 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_partial)
 
         for chunk in chunks:
-            assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+            assert (
+                self.manager.lookup([chunk], None, _CTX)[0] is LookupResult.HIT_PENDING
+            )
 
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
 
         assert [
-            self.primary_tier.lookup(chunk, _CTX) for chunk in chunks
+            self.primary_tier.lookup([chunk], None, _CTX)[0] for chunk in chunks
         ] == expected_results
         expected_source_keys = (
             set()
@@ -765,7 +834,9 @@ class TestTieringOffloadingManager:
 
         monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_deferring)
         for chunk in chunks:
-            assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+            assert (
+                self.manager.lookup([chunk], None, _CTX)[0] is LookupResult.HIT_PENDING
+            )
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
         return events
@@ -792,7 +863,7 @@ class TestTieringOffloadingManager:
         events = self._promote_with_deferred_release(monkeypatch, chunks)
 
         assert len(events) == 1
-        assert [self.primary_tier.lookup(c, _CTX) for c in chunks] == [
+        assert [self.primary_tier.lookup([c], None, _CTX)[0] for c in chunks] == [
             LookupResult.MISS,
             LookupResult.MISS,
         ]
@@ -836,7 +907,7 @@ class TestTieringOffloadingManager:
         self.primary_tier.complete_write(chunk, _CTX, True)
 
         self._release(events)
-        assert self.primary_tier.lookup(chunk[0], _CTX) is LookupResult.HIT
+        assert self.primary_tier.lookup([chunk[0]], None, _CTX)[0] is LookupResult.HIT
 
     def test_deferred_release_partial_failure_holds_only_failed_chunks(
         self, manager_setup, monkeypatch
@@ -847,7 +918,7 @@ class TestTieringOffloadingManager:
             monkeypatch, chunks, successful_indices=(0,)
         )
 
-        assert self.primary_tier.lookup(chunks[0], _CTX) is LookupResult.HIT
+        assert self.primary_tier.lookup([chunks[0]], None, _CTX)[0] is LookupResult.HIT
         assert self.primary_tier.num_deferred_release_chunks == 2
         self._release(events)
         assert self.primary_tier.num_deferred_release_chunks == 0
@@ -892,7 +963,7 @@ class TestTieringOffloadingManager:
 
         # No tier has these chunks: they resolve immediately as misses.
         for chunk in chunks:
-            assert self.manager.lookup(chunk, _CTX) is LookupResult.MISS
+            assert self.manager.lookup([chunk], None, _CTX)[0] is LookupResult.MISS
 
         stats = self.manager.get_stats()
         assert stats is not None
@@ -932,7 +1003,7 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.chunks[chunk] = True
 
         # First lookup finds the chunk in a secondary tier and defers.
-        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.lookup([chunk], None, _CTX)[0] is LookupResult.HIT_PENDING
 
         # Promotion is not treated as unresolved secondary lookup time.
         stats = self._simulate_on_schedule_end(new_req_ids=[_CTX.req_id]).stats
@@ -962,7 +1033,7 @@ class TestTieringOffloadingManager:
         self._simulate_on_schedule_end()
 
         # Next lookup resolves via the now-promoted primary-tier chunk.
-        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT
+        assert self.manager.lookup([chunk], None, _CTX)[0] is LookupResult.HIT
 
         stats = self.manager.get_stats()
         if stats is not None:
@@ -980,11 +1051,11 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(
             self.secondary_tier1,
             "lookup",
-            MagicMock(side_effect=[LookupResult.RETRY, LookupResult.HIT]),
+            MagicMock(side_effect=[[LookupResult.RETRY], [LookupResult.HIT]]),
         )
 
         # First lookup is deferred by the secondary tier.
-        assert self.manager.lookup(chunk, ctx) is LookupResult.RETRY
+        assert self.manager.lookup([chunk], None, ctx)[0] is LookupResult.RETRY
 
         stats = self.manager.get_stats()
         if stats is not None:
@@ -992,7 +1063,7 @@ class TestTieringOffloadingManager:
                 stats.reduce(), TieringOffloadingMetrics.LOOKUP_ASYNC_DELAY
             )
 
-        assert self.manager.lookup(chunk, ctx) is LookupResult.HIT_PENDING
+        assert self.manager.lookup([chunk], None, ctx)[0] is LookupResult.HIT_PENDING
 
         stats = self.manager.get_stats()
         assert stats is not None
@@ -1195,8 +1266,8 @@ class TestTieringOffloadingManager:
 
         self.manager._promotions_held = True
 
-        assert self.manager.lookup(chunks[0], _CTX) is LookupResult.HIT
-        assert self.manager.lookup(chunks[1], _CTX) is LookupResult.MISS
+        assert self.manager.lookup([chunks[0]], None, _CTX)[0] is LookupResult.HIT
+        assert self.manager.lookup([chunks[1]], None, _CTX)[0] is LookupResult.MISS
 
     def test_reset_holds_promotions_until_flushed(self, manager_setup):
         chunk = to_keys(range(1))[0]
@@ -1204,10 +1275,10 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.chunks[chunk] = True
 
         self.manager.reset_cache()
-        assert self.manager.lookup(chunk, _CTX) is LookupResult.MISS
+        assert self.manager.lookup([chunk], None, _CTX)[0] is LookupResult.MISS
 
         self.manager.on_reset_flushed()
-        assert self.manager.lookup(chunk, _CTX) is not LookupResult.MISS
+        assert self.manager.lookup([chunk], None, _CTX)[0] is not LookupResult.MISS
 
     def test_lookup_batches_submit_load_per_request(self, manager_setup, monkeypatch):
         """lookup() defers submit_load until on_schedule_end(), one per request.
@@ -1226,10 +1297,18 @@ class TestTieringOffloadingManager:
         ctx_b = ReqContext(req_id="req_b")
 
         # All lookups return HIT_PENDING: secondary hit triggers promotion
-        assert self.manager.lookup(chunks[0], ctx_a) is LookupResult.HIT_PENDING
-        assert self.manager.lookup(chunks[1], ctx_a) is LookupResult.HIT_PENDING
-        assert self.manager.lookup(chunks[2], ctx_b) is LookupResult.HIT_PENDING
-        assert self.manager.lookup(chunks[3], ctx_b) is LookupResult.HIT_PENDING
+        assert (
+            self.manager.lookup([chunks[0]], None, ctx_a)[0] is LookupResult.HIT_PENDING
+        )
+        assert (
+            self.manager.lookup([chunks[1]], None, ctx_a)[0] is LookupResult.HIT_PENDING
+        )
+        assert (
+            self.manager.lookup([chunks[2]], None, ctx_b)[0] is LookupResult.HIT_PENDING
+        )
+        assert (
+            self.manager.lookup([chunks[3]], None, ctx_b)[0] is LookupResult.HIT_PENDING
+        )
 
         # submit_load must not fire during lookup - only at end of step
         tier1_submit_load.assert_not_called()
@@ -1264,8 +1343,8 @@ class TestTieringOffloadingManager:
         ctx_a = ReqContext(req_id="req_a")
         ctx_b = ReqContext(req_id="req_b")
 
-        result_a = self.manager.lookup(shared_chunk, ctx_a)
-        result_b = self.manager.lookup(shared_chunk, ctx_b)
+        result_a = self.manager.lookup([shared_chunk], None, ctx_a)[0]
+        result_b = self.manager.lookup([shared_chunk], None, ctx_b)[0]
 
         # Both lookups find the shared_chunk and trigger promotion
         # returning HIT_PENDING.
@@ -1651,7 +1730,7 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(
             self.manager.primary_tier,
             "lookup",
-            lambda key, req_context: LookupResult.RETRY,
+            lambda keys, positions, req_context: [LookupResult.RETRY] * len(keys),
         )
 
         with pytest.raises(AssertionError):
@@ -1760,7 +1839,7 @@ class TestTieringOffloadingManager:
         promo_chunk = to_keys([99])[0]
         self.secondary_tier1.chunks[promo_chunk] = True
         assert (
-            self.manager.lookup(promo_chunk, ReqContext(req_id="pending"))
+            self.manager.lookup([promo_chunk], None, ReqContext(req_id="pending"))[0]
             is LookupResult.HIT_PENDING
         )
         assert self.manager._pending_load_submissions
@@ -1797,7 +1876,7 @@ class TestTieringOffloadingManager:
         assert self.primary_tier._num_allocated_chunks == 0
         assert self.primary_tier._free_list == []
         for chunk in chunks:
-            assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.MISS
+            assert self.primary_tier.lookup([chunk], None, _CTX)[0] is LookupResult.MISS
 
         # Pending submission was dropped, not submitted.
         tier1_submit_load.assert_not_called()
@@ -1856,8 +1935,8 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(self.secondary_tier1, "lookup", tier1_lookup)
 
         ctx = ReqContext(req_id="r1", load_tier_filter=load_tier_filter)
-        assert self.manager.lookup(chunks[0], ctx) is LookupResult.HIT
-        assert self.manager.lookup(chunks[1], ctx) is LookupResult.MISS
+        assert self.manager.lookup([chunks[0]], None, ctx)[0] is LookupResult.HIT
+        assert self.manager.lookup([chunks[1]], None, ctx)[0] is LookupResult.MISS
         tier1_lookup.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1880,7 +1959,9 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(self.secondary_tier1, "lookup", tier1_lookup)
 
         ctx = ReqContext(req_id="r2", load_tier_filter=load_tier_filter)
-        assert self.manager.lookup(chunks[0], ctx) is LookupResult.HIT_PENDING
+        assert (
+            self.manager.lookup([chunks[0]], None, ctx)[0] is LookupResult.HIT_PENDING
+        )
         tier1_lookup.assert_called()
 
 

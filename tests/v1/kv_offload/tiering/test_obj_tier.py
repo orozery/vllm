@@ -294,14 +294,14 @@ def lookup_and_wait(
 ) -> list[LookupResult]:
     """Perform a full async lookup cycle and return resolved results."""
     for k in keys:
-        tier.lookup(k, ctx)
+        tier.lookup([k], None, ctx)[0]
     tier.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not tier._lookup_manager._pending_results.empty():
             break
         time.sleep(0.01)
-    return [tier.lookup(k, ctx) for k in keys]
+    return [tier.lookup([k], None, ctx)[0] for k in keys]
 
 
 # ---------------------------------------------------------------------------

@@ -474,7 +474,9 @@ def test_kvcr_tier_maps_query_status(monkeypatch, status, expected):
     kvcr.query_status = status
     tier = _make_tier(monkeypatch, kvcr)
 
-    assert tier.lookup(OffloadKey(b"k0"), ReqContext(req_id="req")) is expected
+    assert (
+        tier.lookup([OffloadKey(b"k0")], None, ReqContext(req_id="req"))[0] is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -502,8 +504,11 @@ def test_kvcr_tier_serves_primary_pin_request(
             lifecycle.append("new")
             return SimpleNamespace()
 
-        def lookup(self, key, req_context):
-            return LookupResult.HIT if key in hit_keys else LookupResult.MISS
+        def lookup(self, keys, positions, req_context):
+            return [
+                LookupResult.HIT if key in hit_keys else LookupResult.MISS
+                for key in keys
+            ]
 
         def create_store_job(self, requested_keys, req_context):
             return TransferJob(

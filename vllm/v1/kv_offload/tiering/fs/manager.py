@@ -16,7 +16,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -224,11 +224,22 @@ class FileSystemTierManager(SecondaryTierManager):
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        result = self._lookup_manager.lookup(key, req_context)
-        if result is None:
-            return LookupResult.RETRY
-        return LookupResult.HIT if result else LookupResult.MISS
+    @override
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        results: list[LookupResult] = []
+        for result in self._lookup_manager.lookup(keys, req_context):
+            if result is None:
+                results.append(LookupResult.RETRY)
+            elif result:
+                results.append(LookupResult.HIT)
+            else:
+                results.append(LookupResult.MISS)
+        return results
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:

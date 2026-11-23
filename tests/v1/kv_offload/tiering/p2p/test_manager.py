@@ -315,29 +315,29 @@ class TestLookup:
     def test_lookup_returns_miss_without_kv_params(self):
         mgr = _make_manager()
         ctx = _req_context(kv_params=None)
-        assert mgr.lookup(OffloadKey(b"key"), ctx) is LookupResult.MISS
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.MISS
 
     def test_lookup_returns_miss_without_required_fields(self):
         mgr = _make_manager()
         ctx = _req_context(kv_params={"remote_prefiller": {"remote_host": "x"}})
-        assert mgr.lookup(OffloadKey(b"key"), ctx) is LookupResult.MISS
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.MISS
 
     def test_lookup_returns_hit_for_valid_request(self):
         mgr = _make_manager()
         ctx = _req_context(kv_params=_remote_prefiller_kv_params())
-        assert mgr.lookup(OffloadKey(b"key"), ctx) is LookupResult.HIT
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.HIT
 
     def test_lookup_returns_miss_for_failed_request(self):
         mgr = _make_manager()
         mgr._failed_req_ids.add("req-1")
         ctx = _req_context(kv_params=_remote_prefiller_kv_params(kv_request_id="req-1"))
-        assert mgr.lookup(OffloadKey(b"key"), ctx) is LookupResult.MISS
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.MISS
 
     def test_lookup_returns_hit_for_different_request_id(self):
         mgr = _make_manager()
         mgr._failed_req_ids.add("req-1")
         ctx = _req_context(kv_params=_remote_prefiller_kv_params(kv_request_id="req-2"))
-        assert mgr.lookup(OffloadKey(b"key"), ctx) is LookupResult.HIT
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.HIT
 
     def test_lookup_returns_miss_without_prefill_key(self):
         """No `remote_prefiller` sub-dict means the request was not routed for
@@ -345,7 +345,7 @@ class TestLookup:
         returns MISS even when a stale `remote_decoder` block is present."""
         mgr = _make_manager()
         ctx = _req_context(kv_params=_remote_decoder_kv_params())
-        assert mgr.lookup(OffloadKey(b"key"), ctx) is LookupResult.MISS
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.MISS
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +408,7 @@ def test_primary_store_only_cascades_to_p2p_for_producers(
         assert {job.tier_idx for job in tiering._jobs.values()} == (
             {0, 1} if expect_p2p_store else {1}
         )
-        assert example.lookup(keys[0], ctx) is LookupResult.HIT
+        assert example.lookup([keys[0]], None, ctx)[0] is LookupResult.HIT
         assert bool(p2p._unbound_stores) is expect_p2p_store
     finally:
         tiering.shutdown()
@@ -430,8 +430,8 @@ class _RecordingParent:
 
         return RequestOffloadingContext()
 
-    def lookup(self, key, ctx):
-        return LookupResult.MISS
+    def lookup(self, keys, positions, ctx):
+        return [LookupResult.MISS] * len(keys)
 
     def create_store_job(self, keys, ctx):
         raise AssertionError("unreachable")
@@ -644,18 +644,18 @@ class TestSubmitLoad:
             kv_params=params,
         )
         ctx = job.req_context
-        assert mgr.lookup(OffloadKey(b"prompt"), ctx) is LookupResult.HIT
+        assert mgr.lookup([OffloadKey(b"prompt")], None, ctx)[0] is LookupResult.HIT
 
         mgr.submit_load(job)
 
         expected = (
             LookupResult.MISS if not symmetric and not empty else LookupResult.HIT
         )
-        assert mgr.lookup(OffloadKey(b"prompt"), ctx) is expected
-        assert mgr.lookup(OffloadKey(b"generated"), ctx) is expected
+        assert mgr.lookup([OffloadKey(b"prompt")], None, ctx)[0] is expected
+        assert mgr.lookup([OffloadKey(b"generated")], None, ctx)[0] is expected
         # A fresh request has its own handoff, even with the same transfer ID.
         fresh = _req_context(kv_params=params)
-        assert mgr.lookup(OffloadKey(b"prompt"), fresh) is LookupResult.HIT
+        assert mgr.lookup([OffloadKey(b"prompt")], None, fresh)[0] is LookupResult.HIT
 
     def test_missing_consumer_flag_fails(self):
         """Peer fields present but neither do_remote_prefill nor
@@ -777,7 +777,7 @@ def test_pd_partial_promotion_does_not_refetch_tail():
     def prefix_lookup():
         results = []
         for key in prompt:
-            results.append(tiering.lookup(key, ctx))
+            results.append(tiering.lookup([key], None, ctx)[0])
             if results[-1] is LookupResult.MISS:
                 break
         return results
@@ -859,7 +859,7 @@ def test_timed_out_load_holds_chunks_until_abort_ack(monkeypatch):
     now[0] += _PD_LOAD_TIMEOUT_S + 1.0
     tiering._process_finished_jobs()
     assert 7 not in tiering._jobs
-    assert primary.lookup(key, ctx) is LookupResult.MISS
+    assert primary.lookup([key], None, ctx)[0] is LookupResult.MISS
     assert primary.num_deferred_release_chunks == 1
     assert primary._get_num_free_chunks() == free_before
 
@@ -1780,22 +1780,22 @@ class TestBidirectionalManager:
             list(mgr_a.get_finished_jobs())
             list(mgr_b.get_finished_jobs())
         assert mgr_a._sessions["B:2"].ready
-        assert mgr_a.lookup(b"key", ctx) == LookupResult.RETRY
+        assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.RETRY
         mgr_a.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=[]))
 
         # Stop the server's progress without closing its live connection.
         lookup_clock.now = _LOOKUP_TIMEOUT_S - 1
         assert list(mgr_a.get_finished_jobs()) == []
-        assert mgr_a.lookup(b"key", ctx) == LookupResult.RETRY
+        assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.RETRY
         lookup_clock.now = _LOOKUP_TIMEOUT_S
         assert list(mgr_a.get_finished_jobs()) == []
-        assert mgr_a.lookup(b"key", ctx) == LookupResult.MISS
+        assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.MISS
         assert "B:2" not in mgr_a._sessions
         assert "B:2" not in mgr_a._data._remote_peers  # type: ignore[attr-defined]  # _FakeData
 
         # A replacement session must not restart the expired request's probes.
         mgr_a._sessions["B:2"] = _FakeSession(peer_id="B:2")  # type: ignore[assignment]
-        assert mgr_a.lookup(b"key", ctx) == LookupResult.MISS
+        assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.MISS
         mgr_a.on_request_finished(ctx)
         assert "req-1" not in mgr_a._failed_req_ids
 
@@ -1808,7 +1808,7 @@ class TestBidirectionalManager:
         list(mgr_a.get_finished_jobs())
         assert not mgr_a._sessions["B:2"].ready
 
-        assert mgr_a.lookup(b"key", ctx) == LookupResult.MISS
+        assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.MISS
         mgr_a.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=[]))
         sent = mgr_a._control._inbound_outbound["B:2"]._outbox  # type: ignore[attr-defined]  # _LoopbackControl
         assert [m[TYPE_KEY] for m in sent] == [ConnectMsg.TYPE]
@@ -1951,14 +1951,16 @@ class TestBidirectionalManager:
             mgr_a.on_new_request(ctx)
             poll_until(both_ready)
             old_peer_session = mgr_b._sessions[peer_a]
-            assert mgr_a.lookup(b"key", ctx) == LookupResult.RETRY
+            assert (
+                mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.RETRY
+            )
             mgr_a.on_schedule_end(
                 ScheduleEndContext(new_req_ids=[], preempted_req_ids=[])
             )
 
             lookup_clock.now = _LOOKUP_TIMEOUT_S
             list(mgr_a.get_finished_jobs())
-            assert mgr_a.lookup(b"key", ctx) == LookupResult.MISS
+            assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.MISS
             assert peer_b not in mgr_a._sessions
             poll_until(lambda: peer_a not in mgr_b._sessions)
             # Wait for old TCP identities to retire before reconnecting.
@@ -1972,7 +1974,7 @@ class TestBidirectionalManager:
             mgr_a.on_new_request(new_ctx)
             poll_until(both_ready)
             assert mgr_b._sessions[peer_a] is not old_peer_session
-            assert mgr_a.lookup(b"key", ctx) == LookupResult.MISS
+            assert mgr_a.lookup([OffloadKey(b"key")], None, ctx)[0] == LookupResult.MISS
         finally:
             for monitor in monitors:
                 monitor.close(linger=0)
@@ -3387,12 +3389,12 @@ def test_held_promotions_answer_peer_lookups_with_miss(monkeypatch):
         for _ in range(3):
             list(consumer.get_finished_jobs())
             tiering.on_schedule_end(step_end)
-        assert consumer.lookup(key, ctx) is LookupResult.RETRY
+        assert consumer.lookup([key], None, ctx)[0] is LookupResult.RETRY
         consumer.on_schedule_end(step_end)
         # The server receives the LookupMsg and serves it in one step.
         tiering.on_schedule_end(step_end)
         list(consumer.get_finished_jobs())
-        return consumer.lookup(key, ctx)
+        return consumer.lookup([key], None, ctx)[0]
 
     try:
         tiering.reset_cache()
@@ -3464,7 +3466,7 @@ def _peer_hit(
         # A probe before the handshake ack falls back to local prefill (MISS).
         session = consumer._sessions.get(f"{host}:{port}")
         if session is not None and session.ready:
-            result = consumer.lookup(key, ctx)
+            result = consumer.lookup([key], None, ctx)[0]
             if result is LookupResult.HIT:
                 return ctx
             assert result is LookupResult.RETRY
@@ -3645,7 +3647,9 @@ def test_reset_cache_releases_parked_p2p_slots(drain_peers):
         tiering.on_schedule_end(ScheduleEndContext([], ()))
         tiering.reset_cache()
         tiering.on_reset_flushed()
-        assert all(tiering.lookup(key, ctx) is LookupResult.MISS for key in keys)
+        assert all(
+            tiering.lookup([key], None, ctx)[0] is LookupResult.MISS for key in keys
+        )
         replacement = tiering.prepare_store(
             [OffloadKey(str(i).encode()) for i in range(8)],
             ctx,
@@ -3733,11 +3737,11 @@ def test_reset_symmetric_lookup_rounds(drain_peers, fetch_before_reset):
         tiering.on_schedule_end(step)
 
     def lookup():
-        assert consumer.lookup(key, ctx) is LookupResult.RETRY
+        assert consumer.lookup([key], None, ctx)[0] is LookupResult.RETRY
         consumer.on_schedule_end(step)
         tiering.on_schedule_end(step)
         list(consumer.get_finished_jobs())
-        assert consumer.lookup(key, ctx) is LookupResult.HIT
+        assert consumer.lookup([key], None, ctx)[0] is LookupResult.HIT
 
     try:
         tiering.on_new_request(local_ctx)
@@ -3859,7 +3863,7 @@ class TestNonDictRoleParamsRejected:
         ctx = _req_context(kv_params={"remote_prefiller": "not-a-dict"})
         result = mgr.on_new_request(ctx)
         assert result.policy is OffloadPolicy.CHUNK_LEVEL
-        assert mgr.lookup(b"key", ctx) is LookupResult.MISS
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.MISS
 
     def test_malformed_decoder_role_fails_store(self):
         """Malformed remote_decoder does not crash; submit_store fails
@@ -3879,4 +3883,4 @@ class TestNonDictRoleParamsRejected:
         ctx = _req_context(kv_params={"remote_kv_source": "not-a-dict"})
         result = mgr.on_new_request(ctx)
         assert result.policy is OffloadPolicy.CHUNK_LEVEL
-        assert mgr.lookup(b"key", ctx) is LookupResult.MISS
+        assert mgr.lookup([OffloadKey(b"key")], None, ctx)[0] is LookupResult.MISS

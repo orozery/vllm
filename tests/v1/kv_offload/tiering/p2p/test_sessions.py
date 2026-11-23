@@ -294,15 +294,24 @@ class FakeParent:
         self.calls.append(("on_new_request", ctx.req_id))
         return RequestOffloadingContext()
 
-    def lookup(self, key: OffloadKey, ctx: ReqContext) -> LookupResult:
-        self.calls.append(("lookup", key, ctx.req_id))
-        if key in self.pending:
-            return LookupResult.HIT_PENDING
-        if key in self.retry:
-            return LookupResult.RETRY
-        if key in self.stored:
-            return LookupResult.HIT
-        return LookupResult.MISS
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        ctx: ReqContext,
+    ) -> Sequence[LookupResult]:
+        results: list[LookupResult] = []
+        for key in keys:
+            self.calls.append(("lookup", key, ctx.req_id))
+            if key in self.pending:
+                results.append(LookupResult.HIT_PENDING)
+            elif key in self.retry:
+                results.append(LookupResult.RETRY)
+            elif key in self.stored:
+                results.append(LookupResult.HIT)
+            else:
+                results.append(LookupResult.MISS)
+        return results
 
     def create_store_job(
         self,
