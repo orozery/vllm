@@ -4,7 +4,7 @@
 
 import ctypes
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import numpy as np
@@ -320,11 +320,21 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             obj_handle=obj_handle,
         )
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        result = self._lookup_manager.lookup(key, req_context)
-        if result is None:
-            return LookupResult.RETRY
-        return LookupResult.HIT if result else LookupResult.MISS
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        results: list[LookupResult] = []
+        for result in self._lookup_manager.lookup(keys, req_context):
+            if result is None:
+                results.append(LookupResult.RETRY)
+            elif result:
+                results.append(LookupResult.HIT)
+            else:
+                results.append(LookupResult.MISS)
+        return results
 
     def submit_store(self, job_metadata: TransferJob) -> None:
         self._store_jobs[job_metadata.job_id] = job_metadata

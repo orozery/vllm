@@ -211,13 +211,22 @@ class CPUOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        chunk = self._policy.get(key)
-        if chunk is None:
-            return LookupResult.MISS
-        if not chunk.is_ready:
-            return LookupResult.HIT_PENDING
-        return LookupResult.HIT
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        results: list[LookupResult] = []
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None:
+                results.append(LookupResult.MISS)
+            elif chunk.is_ready:
+                results.append(LookupResult.HIT)
+            else:
+                results.append(LookupResult.HIT_PENDING)
+        return results
 
     @override
     def get_load_source(

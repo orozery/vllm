@@ -248,7 +248,7 @@ This class runs in the scheduler, tracks which blocks are offloaded
 and their address.
 
 The class provides the following primitives:
-    lookup() - check whether a single block is offloaded and ready.
+    lookup() - check whether the given blocks are offloaded and ready.
     prepare_load() - prepare given blocks to be read.
         The given blocks will be protected from eviction.
         This function returns a LoadSpec which encapsulates
@@ -361,17 +361,30 @@ class OffloadingManager(ABC):
         return nullcontext()
 
     @abstractmethod
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        """Checks whether a single block is offloaded and ready to be read.
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        """Checks whether the given blocks are offloaded and ready to be read.
+
+        The call is total: it returns exactly one result per key, in order,
+        and never stops at a miss or searches for a window. Those scan rules
+        depend on the group type and stay with the caller, which also decides
+        how the keys are sliced and paged.
 
         Args:
-            key: the key identifying the block to lookup.
+            keys: the keys identifying the blocks to look up.
+            positions: each key's end-token position, parallel to `keys`, or
+                None when the caller tracks no positions (for example, a
+                probe of another request's keys).
             req_context: per-request context (e.g. kv_transfer_params).
 
         Returns:
-            HIT if the block is offloaded and ready, MISS if not found,
-            HIT_PENDING if found but not yet readable, or RETRY if the
-            lookup should be retried later.
+            One result per key: HIT if the block is offloaded and ready, MISS
+            if not found, HIT_PENDING if found but not yet readable, or RETRY
+            if the lookup should be retried later.
 
         """
         pass

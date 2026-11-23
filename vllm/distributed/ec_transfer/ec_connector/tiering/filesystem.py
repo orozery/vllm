@@ -363,7 +363,7 @@ class ECFileSystemTierManager:
             self._evict_to_capacity()
             return False
         key = self._lookup.key(cache_key, file_size_bytes)
-        result = self._lookup.lookup(key, ReqContext(req_id=request_id))
+        result = self._lookup.lookup([key], ReqContext(req_id=request_id))[0]
         if entry is not None:
             # Register the owner so a failed indexed read can be marked MISS.
             # Supersede the pending probe before flush; no file check is queued.

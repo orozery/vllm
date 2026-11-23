@@ -782,11 +782,11 @@ def test_pending_promotion_captures_payload_before_inventory(history, success):
     scheduler = SimpleNamespace(manager=primary, _events_tracker=tracker)
     assert (
         OffloadingConnectorScheduler._maximal_prefix_lookup(
-            scheduler, [key], ctx, req, group, 0
+            scheduler, [key], None, ctx, req, group, 0
         )
         is None
     )
-    assert primary.lookup(key, ctx) is LookupResult.HIT_PENDING
+    assert primary.lookup([key], None, ctx)[0] is LookupResult.HIT_PENDING
     assert list(tracker.take_events(primary.take_events())) == []
 
     if history == "secondary_only":
@@ -807,7 +807,7 @@ def test_pending_promotion_captures_payload_before_inventory(history, success):
         assert raw_events[0].removal_expected
     events = list(tracker.take_events(raw_events))
     if success:
-        assert primary.lookup(key, ctx) is LookupResult.HIT
+        assert primary.lookup([key], None, ctx)[0] is LookupResult.HIT
         assert len(events) == 1 and isinstance(events[0], BlockStored)
         assert events[0].block_size == 1600
         list(
@@ -816,7 +816,7 @@ def test_pending_promotion_captures_payload_before_inventory(history, success):
             )
         )
     else:
-        assert primary.lookup(key, ctx) is LookupResult.MISS
+        assert primary.lookup([key], None, ctx)[0] is LookupResult.MISS
         assert events == []
     assert key not in tracker._pending_event_metadata
 
@@ -839,7 +839,7 @@ def test_failed_pending_chunk_does_not_remove_shared_ready_prefix():
     scheduler = SimpleNamespace(manager=primary, _events_tracker=tracker)
     assert (
         OffloadingConnectorScheduler._maximal_prefix_lookup(
-            scheduler, [failed_key], ctx, failed_req, group, 0
+            scheduler, [failed_key], None, ctx, failed_req, group, 0
         )
         is None
     )
@@ -847,7 +847,7 @@ def test_failed_pending_chunk_does_not_remove_shared_ready_prefix():
         [failed_key], ctx, trigger=StoreTrigger.ON_COMPUTE, success=False
     )
     assert list(tracker.take_events(primary.take_events())) == []
-    assert primary.lookup(ready_key, ctx) is LookupResult.HIT
+    assert primary.lookup([ready_key], None, ctx)[0] is LookupResult.HIT
     assert ready_key in tracker._pending_event_metadata
     assert failed_key not in tracker._pending_event_metadata
 
@@ -866,7 +866,7 @@ def test_failed_pending_retry_preserves_replacement_metadata(success):
 
         assert (
             OffloadingConnectorScheduler._maximal_prefix_lookup(
-                scheduler, [key], ctx, req, group, 0
+                scheduler, [key], None, ctx, req, group, 0
             )
             is None
         )
@@ -882,7 +882,7 @@ def test_failed_pending_retry_preserves_replacement_metadata(success):
     assert inventory.block_size == 1600
     assert inventory.token_ids == req.all_token_ids
     assert old_cleanup == []
-    assert primary.lookup(key, ctx) is LookupResult.HIT_PENDING
+    assert primary.lookup([key], None, ctx)[0] is LookupResult.HIT_PENDING
     primary.complete_store([key], ctx, trigger=StoreTrigger.ON_COMPUTE, success=success)
     events = list(tracker.take_events(primary.take_events()))
     assert len(events) == int(success)

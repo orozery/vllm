@@ -73,6 +73,11 @@ logger = init_logger(__name__)
 # A cache reset fence held this long is reported once.
 _RESET_FENCE_WARN_S = 60
 
+# First lookup page size. Scans grow their pages geometrically, and stop as
+# soon as a miss, a complete window or a ready partial tail settles them, so a
+# short hit costs one small page instead of the whole key slice.
+_LOOKUP_PAGE_MIN = 8
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -474,39 +479,54 @@ class OffloadingConnectorScheduler:
 
     def _maximal_prefix_lookup(
         self,
-        keys: Iterable[OffloadKey],
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
         req_context: ReqContext,
         req: Request,
         group_config: GroupOffloadConfig,
         start_chunk_idx: int,
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
-        or None if the backend deferred a lookup."""
+        or None if the backend deferred a lookup.
+
+        Keys are probed in pages that double in size, so a short hit (a cold
+        or partly-cached prompt) costs a small page rather than the whole
+        slice, while a long hit costs O(log n) crossings.
+        """
         hit_count = 0
         defer_lookup = False
-        for local_idx, key in enumerate(keys):
-            result = self.manager.lookup(key, req_context)
-            match result:
-                case LookupResult.HIT | LookupResult.HIT_PENDING:
-                    self._events_tracker.record_lookup(
-                        req,
-                        group_config,
-                        start_chunk_idx + local_idx,
-                        key,
-                    )
-                    hit_count += 1
-                    defer_lookup |= result is LookupResult.HIT_PENDING
-                case LookupResult.RETRY:
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups (until a miss is detected).
-                    defer_lookup = True
-                case LookupResult.MISS:
-                    break
+        page = _LOOKUP_PAGE_MIN
+        start = 0
+        while start < len(keys):
+            stop = min(len(keys), start + page)
+            page_positions = None if positions is None else positions[start:stop]
+            results = self.manager.lookup(keys[start:stop], page_positions, req_context)
+            assert len(results) == stop - start, "lookup must answer every key"
+            for offset, result in enumerate(results):
+                key = keys[start + offset]
+                match result:
+                    case LookupResult.HIT | LookupResult.HIT_PENDING:
+                        self._events_tracker.record_lookup(
+                            req,
+                            group_config,
+                            start_chunk_idx + start + offset,
+                            key,
+                        )
+                        hit_count += 1
+                        defer_lookup |= result is LookupResult.HIT_PENDING
+                    case LookupResult.RETRY:
+                        # Keep scanning to let the manager kick off async lookups.
+                        defer_lookup = True
+                    case LookupResult.MISS:
+                        return hit_count if not defer_lookup else None
+            start = stop
+            page *= 2
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
         self,
         keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
         sliding_window_size: int,
         req_context: ReqContext,
         initial_window_size: int | None = None,
@@ -515,38 +535,61 @@ class OffloadingConnectorScheduler:
         `sliding_window_size` consecutive hits, scanning from the end.
         The first run may need a larger window for a partial rightmost chunk.
         Returns 0 on miss, None if the backend deferred a lookup."""
+        if not keys:
+            return 0
+
+        def probe(start: int, stop: int) -> list[LookupResult]:
+            sliced_positions = None if positions is None else positions[start:stop]
+            results = list(
+                self.manager.lookup(keys[start:stop], sliced_positions, req_context)
+            )
+            assert len(results) == stop - start, "lookup must answer every key"
+            return results
+
         defer_lookup = False
         pending_in_window = False
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
-        for idx in range(len(keys) - 1, -1, -1):
-            match self.manager.lookup(keys[idx], req_context):
-                case LookupResult.HIT:
-                    consecutive_hits += 1
-                case LookupResult.HIT_PENDING:
-                    # Block is in cache, just not readable yet — counts
-                    # as hit for the consecutive streak. Don't break:
-                    # keep scanning to let manager kick off async lookups.
-                    pending_in_window = True
-                    consecutive_hits += 1
-                case LookupResult.RETRY:
-                    # Block location uncertain — does not count as hit.
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups.
-                    defer_lookup = True
-                    consecutive_hits = 0
-                    pending_in_window = False
-                    required_window = sliding_window_size
-                case LookupResult.MISS:
-                    consecutive_hits = 0
-                    # This gap rules out the incomplete window to its right.
-                    pending_in_window = False
-                    required_window = sliding_window_size
-            if consecutive_hits == required_window:
-                return (
-                    None if defer_lookup or pending_in_window else idx + required_window
-                )
-        return None if defer_lookup or pending_in_window else consecutive_hits
+
+        # Probe the tail window first: a warm tail settles the scan. A
+        # fragmented tail then grows leftwards in doubling pages, so the scan
+        # stops soon after the window it finds instead of probing all history.
+        scan_stop = len(keys)
+        page = min(required_window, scan_stop)
+        while True:
+            start = max(0, scan_stop - page)
+            results = probe(start, scan_stop)
+            for offset in range(len(results) - 1, -1, -1):
+                idx = start + offset
+                match results[offset]:
+                    case LookupResult.HIT:
+                        consecutive_hits += 1
+                    case LookupResult.HIT_PENDING:
+                        # Block is in cache, just not readable yet — counts
+                        # as hit for the consecutive streak.
+                        pending_in_window = True
+                        consecutive_hits += 1
+                    case LookupResult.RETRY:
+                        # Block location uncertain — does not count as hit.
+                        defer_lookup = True
+                        consecutive_hits = 0
+                        pending_in_window = False
+                        required_window = sliding_window_size
+                    case LookupResult.MISS:
+                        consecutive_hits = 0
+                        # This gap rules out the incomplete window to its right.
+                        pending_in_window = False
+                        required_window = sliding_window_size
+                if consecutive_hits == required_window:
+                    return (
+                        None
+                        if defer_lookup or pending_in_window
+                        else idx + required_window
+                    )
+            if start == 0:
+                return None if defer_lookup or pending_in_window else consecutive_hits
+            scan_stop = start
+            page = max(page, _LOOKUP_PAGE_MIN) * 2
 
     def _lookup_complete_chunks(
         self,
@@ -647,6 +690,10 @@ class OffloadingConnectorScheduler:
                 )
                 start_chunk_idx = num_computed_tokens // tokens_per_chunk
                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
+                positions = [
+                    (start_chunk_idx + i + 1) * tokens_per_chunk
+                    for i in range(len(offload_keys))
+                ]
 
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
@@ -655,6 +702,7 @@ class OffloadingConnectorScheduler:
                     looked_up_full_attention = True
                     num_hit_chunks = self._maximal_prefix_lookup(
                         offload_keys,
+                        positions,
                         req_status.req_context,
                         req_status.req,
                         group_config,
@@ -676,6 +724,7 @@ class OffloadingConnectorScheduler:
                     assert initial_window is not None
                     num_hit_chunks = self._sliding_window_lookup(
                         offload_keys,
+                        positions,
                         required_window,
                         req_status.req_context,
                         initial_window,
@@ -840,73 +889,104 @@ class OffloadingConnectorScheduler:
                 pending |= key in (self._chunks_being_loaded or ())
                 if group_state.lookup_hit_end_chunk_idx <= bridge_chunk_idx:
                     unconfirmed_bridge_keys.append((group_config, key))
-            for _, key in unconfirmed_bridge_keys:
-                result = self.manager.lookup(key, req_status.req_context)
-                if result is LookupResult.MISS:
-                    max_boundary = bridge_boundary - tokens_per_hash
-                    break
-                pending |= result is not LookupResult.HIT
+            bridge_keys = [key for _, key in unconfirmed_bridge_keys]
+            if bridge_keys:
+                bridge_results = self.manager.lookup(
+                    bridge_keys,
+                    [
+                        (bridge_chunk_idx + 1) * group_config.tokens_per_chunk
+                        for group_config, _ in unconfirmed_bridge_keys
+                    ],
+                    req_status.req_context,
+                )
+                assert len(bridge_results) == len(bridge_keys), (
+                    "lookup must answer every key"
+                )
+                for _, result in zip(unconfirmed_bridge_keys, bridge_results):
+                    if result is LookupResult.MISS:
+                        max_boundary = bridge_boundary - tokens_per_hash
+                        break
+                    pending |= result is not LookupResult.HIT
         bridge_pending = pending
         # A tail of this request may lie below a sibling's longer full-attention
         # prefix. A block-aligned boundary there is a complete chunk, which the
         # complete-chunk lookup already missed.
+        req = req_status.req
+        req_context = req_status.req_context
+        candidate_boundaries: list[int] = []
+        boundary_keys: list[list[tuple[GroupOffloadConfig, OffloadKey]]] = []
         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
             if boundary <= anchor_boundary and boundary % block_size == 0:
                 continue
-            loads_bridge = boundary >= bridge_boundary
-            hit, boundary_pending = self._lookup_partial_tail(
-                req_status, boundary, loads_bridge and bridge_pending
-            )
-            if hit:
-                # The complete-chunk lookup recorded the confirmed bridge keys.
-                if loads_bridge:
+            candidate_boundaries.append(boundary)
+            keys_for_boundary: list[tuple[GroupOffloadConfig, OffloadKey]] = []
+            for group_config in self.config.kv_group_configs:
+                # Probes do not record positions: only the boundary that is
+                # actually loaded should appear in the request's key map.
+                key = req_status.boundary_key(group_config.group_idx, boundary)
+                keys_for_boundary.append((group_config, key))
+            boundary_keys.append(keys_for_boundary)
+
+        # Probe candidates from the highest boundary down in doubling pages,
+        # and take the first one whose keys are all ready.
+        first = 0
+        page = _LOOKUP_PAGE_MIN
+        while first < len(candidate_boundaries):
+            last = min(len(candidate_boundaries), first + page)
+            page_keys: list[OffloadKey] = []
+            page_positions: list[int] = []
+            for boundary, keys_for_boundary in zip(
+                candidate_boundaries[first:last], boundary_keys[first:last]
+            ):
+                for _, key in keys_for_boundary:
+                    page_keys.append(key)
+                    page_positions.append(boundary)
+            probes = list(self.manager.lookup(page_keys, page_positions, req_context))
+            assert len(probes) == len(page_keys), "lookup must answer every key"
+            offset = 0
+            for boundary, keys_for_boundary in zip(
+                candidate_boundaries[first:last], boundary_keys[first:last]
+            ):
+                results = probes[offset : offset + len(keys_for_boundary)]
+                offset += len(keys_for_boundary)
+                if any(result is LookupResult.MISS for result in results):
+                    continue
+                # The offload manager can report HIT as soon as the source chunk
+                # is ready, while its earlier GPU load is still in flight. Do
+                # not schedule the same partial-tail transfer twice.
+                boundary_pending = (
+                    boundary >= bridge_boundary and bridge_pending
+                ) or any(
+                    key in (self._chunks_being_loaded or ())
+                    or result is not LookupResult.HIT
+                    for (_, key), result in zip(keys_for_boundary, results)
+                )
+                if boundary_pending:
+                    pending = True
+                    continue
+                if boundary >= bridge_boundary:
+                    # The complete-chunk lookup recorded the confirmed bridge
+                    # keys.
                     for group_config, key in unconfirmed_bridge_keys:
                         self._events_tracker.record_lookup(
-                            req_status.req, group_config, bridge_chunk_idx, key
+                            req, group_config, bridge_chunk_idx, key
                         )
+                for group_config, _ in keys_for_boundary:
+                    key = req_status.register_boundary_key(
+                        group_config.group_idx, boundary
+                    )
+                    self._events_tracker.record_partial_lookup(
+                        req, group_config, boundary, key
+                    )
                 req_status.partial_tail_boundary = boundary
                 return boundary - local_tokens
-            pending |= boundary_pending
+
+            first = last
+            page *= 2
 
         if pending and complete_hit == 0:
             return None
         return complete_hit
-
-    def _lookup_partial_tail(
-        self,
-        req_status: RequestOffloadState,
-        boundary: int,
-        bridge_pending: bool,
-    ) -> tuple[bool, bool]:
-        """Look up every key a partial-tail hit at `boundary` loads.
-
-        `bridge_pending` is True if a complete chunk that the hit also loads
-        is not ready yet.
-        Returns `(hit, pending)`. `hit` is True only if every key is ready.
-        `pending` is True if no required key missed and a required key or
-        bridge chunk is not ready yet.
-        """
-        req = req_status.req
-        req_context = req_status.req_context
-        pending = bridge_pending
-        boundary_keys: list[tuple[GroupOffloadConfig, OffloadKey]] = []
-        for group_config in self.config.kv_group_configs:
-            key = req_status.register_boundary_key(group_config.group_idx, boundary)
-            # The offload manager can report HIT as soon as the source chunk
-            # is ready, while its earlier GPU load is still in flight.  Do
-            # not schedule the same partial-tail transfer twice.
-            pending |= key in (self._chunks_being_loaded or ())
-            result = self.manager.lookup(key, req_context)
-            if result is LookupResult.MISS:
-                return False, False
-            pending |= result is not LookupResult.HIT
-            boundary_keys.append((group_config, key))
-
-        if pending:
-            return False, True
-        for group_config, key in boundary_keys:
-            self._events_tracker.record_partial_lookup(req, group_config, boundary, key)
-        return True, False
 
     def _maybe_register_shared_prefix_junction(
         self, req_status: RequestOffloadState, boundary: int, num_hit_tokens: int

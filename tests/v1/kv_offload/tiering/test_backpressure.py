@@ -97,8 +97,11 @@ class DelayedSecondaryTierManager(SecondaryTierManager):
         self.fail_stores = False
         self.num_store_submissions = 0
 
-    def lookup(self, key, req_context):
-        return LookupResult.HIT if key in self.blocks else LookupResult.MISS
+    def lookup(self, keys, positions, req_context):
+        return [
+            LookupResult.HIT if key in self.blocks else LookupResult.MISS
+            for key in keys
+        ]
 
     def submit_store(self, job_metadata: TransferJob) -> None:
         self.num_store_submissions += 1
@@ -473,7 +476,7 @@ class TestBackpressure:
 
         # Blocks should be in primary but NOT in secondary.
         for k in keys:
-            assert self.primary.lookup(k, _CTX) is LookupResult.HIT
+            assert self.primary.lookup([k], None, _CTX)[0] is LookupResult.HIT
         assert self.tier.get_num_blocks() == initial_blocks
 
     def test_stores_resume_after_pressure_clears(self, setup):
@@ -587,7 +590,7 @@ class TestBackpressure:
 
         # Lookups should still initiate promotion.
         for b in blocks:
-            result = self.manager.lookup(b, _CTX)
+            result = self.manager.lookup([b], None, _CTX)[0]
             assert result is LookupResult.HIT_PENDING
 
     def _store_and_complete(self, keys):

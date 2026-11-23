@@ -5,7 +5,7 @@
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -123,8 +123,8 @@ class ParentManager(ABC):
 
     Required call sequence for each remote request:
         1. on_new_request(req_context)  — set up per-request state
-        2. lookup(key, req_context)     — check chunk availability
-           (repeat per chunk)
+        2. lookup(keys, positions, req_context) — check chunk availability,
+           one result per key
         3. create_store_job(keys, req_context) — pin chunks and get a
            job handle
         4. on_request_finished(req_context) — clean up per-request state
@@ -138,7 +138,25 @@ class ParentManager(ABC):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext: ...
 
     @abstractmethod
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult: ...
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        """Check which of `keys` this manager holds, one result per key.
+
+        Args:
+            keys: the keys to look up.
+            positions: each key's end-token position, parallel to `keys`, or
+                None when the tier tracks no positions for these keys.
+            req_context: per-request context.
+
+        Returns:
+            One result per key, in order.
+
+        """
+        ...
 
     @abstractmethod
     def create_store_job(
@@ -237,17 +255,24 @@ class SecondaryTierManager(ABC):
         return self._bp_detector
 
     @abstractmethod
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        """Check whether a chunk exists in this secondary tier.
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        """Check which of `keys` exist in this secondary tier.
 
         Args:
-            key: Offload key to look up.
+            keys: Offload keys to look up.
+            positions: each key's end-token position, parallel to `keys`, or
+                None when the caller tracks no positions.
             req_context: per-request context (e.g. kv_transfer_params).
 
         Returns:
-            HIT if the chunk is present and ready,
-            MISS if not found,
-            or RETRY if the chunk is being transferred (retry later).
+            One result per key, in order: HIT if the chunk is present and
+            ready, MISS if not found, or RETRY if the chunk is being
+            transferred (retry later).
 
         """
         pass

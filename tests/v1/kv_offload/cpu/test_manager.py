@@ -287,7 +287,7 @@ def test_already_stored_chunk_not_evicted_during_prepare_store(eviction_policy):
     )
 
     # chunk 2 must still be present in the cache
-    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
 
 
 def test_filter_reused_manager_reports_stores_skipped_counter():
@@ -512,7 +512,7 @@ def test_cpu_manager_reports_cache_write_and_read_usage_gauges():
     check_split_usage_stats(manager, write=0.0, read=0.0, total=0.0)
 
     # Load path: pins read usage until complete_load.
-    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
     manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
     check_split_usage_stats(manager, write=0.0, read=0.25, total=0.25)
 
@@ -541,6 +541,27 @@ def test_cpu_manager_clears_write_usage_after_failed_store():
     check_split_usage_stats(manager, write=0.0, read=0.0, total=0.0)
 
 
+def test_batched_lookup_returns_one_result_per_key_in_order():
+    """`lookup` is total: a slice yields one result per key, in order."""
+    manager = make_cpu_manager(num_chunks=4, cache_policy="lru")
+    manager.prepare_store(
+        to_keys([1, 2]), _EMPTY_REQ_CTX, trigger=StoreTrigger.ON_COMPUTE
+    )
+    manager.complete_store(
+        to_keys([1, 2]), _EMPTY_REQ_CTX, trigger=StoreTrigger.ON_COMPUTE
+    )
+    manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX, trigger=StoreTrigger.ON_COMPUTE)
+
+    results = manager.lookup(to_keys([1, 9, 3, 2]), [16, 32, 48, 64], _EMPTY_REQ_CTX)
+
+    assert list(results) == [
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.HIT_PENDING,
+        LookupResult.HIT,
+    ]
+
+
 def test_cpu_manager():
     """Tests CPUOffloadingManager with lru policy."""
     # initialize a CPU manager with a capacity of 4 chunks
@@ -560,8 +581,14 @@ def test_cpu_manager():
     )
 
     # lookup [1, 2] -> write in-flight, not yet ready
-    assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
-    assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
+    assert (
+        cpu_manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0]
+        is LookupResult.HIT_PENDING
+    )
+    assert (
+        cpu_manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0]
+        is LookupResult.HIT_PENDING
+    )
 
     # no events so far
     assert list(cpu_manager.take_events()) == []
@@ -573,9 +600,9 @@ def test_cpu_manager():
     verify_events(cpu_manager.take_events(), expected_stores=({1, 2},))
 
     # lookup [1, 2]
-    assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert cpu_manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(3)], None, _EMPTY_REQ_CTX)[0] is LookupResult.MISS
 
     # prepare store [2, 3, 4, 5] -> evicts [1]
     prepare_store_output = cpu_manager.prepare_store(
@@ -607,12 +634,12 @@ def test_cpu_manager():
     )
 
     # lookup (now that we have [2, 3, 4, 5])
-    assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
-    assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(0), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert cpu_manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0] is LookupResult.MISS
+    assert cpu_manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(3)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(4)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(5)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(0)], None, _EMPTY_REQ_CTX)[0] is LookupResult.MISS
 
     # prepare load [2, 3]
     load_ctx = make_req_context("load-2-3")
@@ -672,8 +699,8 @@ def test_cpu_manager():
     )
 
     # assert [7] is still stored, but [9] is not
-    assert cpu_manager.lookup(to_key(7), _EMPTY_REQ_CTX) is LookupResult.HIT
-    assert cpu_manager.lookup(to_key(9), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert cpu_manager.lookup([to_key(7)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+    assert cpu_manager.lookup([to_key(9)], None, _EMPTY_REQ_CTX)[0] is LookupResult.MISS
 
     verify_events(
         cpu_manager.take_events(),
@@ -736,7 +763,10 @@ def test_lru_batch_eviction_failure_is_atomic():
 
     protected = set(keys[1:])
     assert policy.evict(2, protected) is None
-    assert all(manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT for key in keys)
+    assert all(
+        manager.lookup([key], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+        for key in keys
+    )
 
     evicted = policy.evict(1, protected)
     assert evicted is not None
@@ -829,8 +859,14 @@ class TestARCPolicy:
         )
 
         # lookup [1, 2] -> write in-flight, not yet ready
-        assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
-        assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
+        assert (
+            cpu_manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0]
+            is LookupResult.HIT_PENDING
+        )
+        assert (
+            cpu_manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0]
+            is LookupResult.HIT_PENDING
+        )
 
         # no events so far
         assert list(cpu_manager.take_events()) == []
@@ -842,9 +878,16 @@ class TestARCPolicy:
         verify_events(cpu_manager.take_events(), expected_stores=({1, 2},))
 
         # lookup [1, 2]
-        assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
-        assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
-        assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
+        assert (
+            cpu_manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+        )
+        assert (
+            cpu_manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+        )
+        assert (
+            cpu_manager.lookup([to_key(3)], None, _EMPTY_REQ_CTX)[0]
+            is LookupResult.MISS
+        )
 
         # chunks should be in T1 (recent)
         assert len(arc_policy.t1) == 2
@@ -1147,9 +1190,15 @@ class TestARCPolicy:
             to_keys(stored_keys), _EMPTY_REQ_CTX, trigger=StoreTrigger.ON_COMPUTE
         )
         for key in stored_keys:
-            assert manager.lookup(to_key(key), _EMPTY_REQ_CTX) is LookupResult.HIT
+            assert (
+                manager.lookup([to_key(key)], None, _EMPTY_REQ_CTX)[0]
+                is LookupResult.HIT
+            )
         for key in pinned + protected:
-            assert manager.lookup(to_key(key), _EMPTY_REQ_CTX) is LookupResult.HIT
+            assert (
+                manager.lookup([to_key(key)], None, _EMPTY_REQ_CTX)[0]
+                is LookupResult.HIT
+            )
         manager.complete_load(to_keys(pinned), _EMPTY_REQ_CTX)
 
     def test_batch_eviction_failure_is_atomic(self):
@@ -1262,7 +1311,10 @@ class TestARCPolicy:
         )
 
         # chunk 5 should not be in cache
-        assert cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.MISS
+        assert (
+            cpu_manager.lookup([to_key(5)], None, _EMPTY_REQ_CTX)[0]
+            is LookupResult.MISS
+        )
         # chunk 5 should not be in T1 or T2
         assert to_keys([5])[0] not in arc_policy.t1
         assert to_keys([5])[0] not in arc_policy.t2
@@ -1312,8 +1364,12 @@ class TestARCPolicy:
         )
 
         # verify chunks 2, 3 (in T2) are still present
-        assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
-        assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.HIT
+        assert (
+            cpu_manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+        )
+        assert (
+            cpu_manager.lookup([to_key(3)], None, _EMPTY_REQ_CTX)[0] is LookupResult.HIT
+        )
 
         # verify events
         events = list(cpu_manager.take_events())
@@ -1371,8 +1427,8 @@ def test_filter_reused_manager():
     )
 
     # lookup() does not count towards store admission
-    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
-    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.lookup([to_key(1)], None, _EMPTY_REQ_CTX)[0] is LookupResult.MISS
+    assert manager.lookup([to_key(2)], None, _EMPTY_REQ_CTX)[0] is LookupResult.MISS
     # store_threshold > 1 means the reuse tracker is enabled, so counts exists.
     assert manager.counts is not None
     assert not manager.counts
@@ -2117,7 +2173,10 @@ def test_unfinished_prefix_survives_pressure_across_store_batches(
     assert output is not None
     assert set(output.evicted_keys) == {group[-1] for group in groups}
     for group in groups:
-        assert all(manager.lookup(key, ctx) is LookupResult.HIT for key in group[:-1])
+        assert all(
+            manager.lookup([key], None, ctx)[0] is LookupResult.HIT
+            for key in group[:-1]
+        )
 
 
 @pytest.mark.parametrize("cache_policy", ["lru", "arc"])
@@ -2156,7 +2215,7 @@ def test_unfinished_reused_prefix_outlives_new_tail(reuse_method, cache_policy):
     )
     assert output is not None
     assert set(output.evicted_keys) == {middle, tail}
-    assert manager.lookup(head, ctx) is LookupResult.HIT
+    assert manager.lookup([head], None, ctx)[0] is LookupResult.HIT
 
 
 @pytest.mark.parametrize("cache_policy", ["lru", "arc"])
@@ -2217,8 +2276,8 @@ def test_arc_running_request_ages_as_its_oldest_t1_chunk():
     )
     assert output is not None
     assert output.evicted_keys == [old_key, tail, middle]
-    assert manager.lookup(head, running) is LookupResult.HIT
-    assert manager.lookup(newer_key, newer) is LookupResult.HIT
+    assert manager.lookup([head], None, running)[0] is LookupResult.HIT
+    assert manager.lookup([newer_key], None, newer)[0] is LookupResult.HIT
 
 
 def test_arc_running_request_can_be_evicted_entirely():
@@ -2341,7 +2400,7 @@ def test_arc_request_finishing_after_reset_ignores_pre_reset_chunks():
     )
     manager.on_request_finished(running)
     manager.complete_load([other_key], other)
-    assert manager.lookup(other_key, other) is LookupResult.HIT
+    assert manager.lookup([other_key], None, other)[0] is LookupResult.HIT
 
 
 def test_lru_failed_store_retry_preserves_prefix_order():

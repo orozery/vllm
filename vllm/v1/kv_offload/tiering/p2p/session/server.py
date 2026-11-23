@@ -520,8 +520,8 @@ class ServerRole:
     ) -> list[OffloadKey]:
         """Poll `keys` against the tiering manager and pin any HITs.
 
-        For each key not already definitively resolved, query
-        `parent.lookup` and record the outcome on `lookup`: HIT / MISS
+        Queries `parent.lookup` once for the keys not already definitively
+        resolved and records each outcome on `lookup`: HIT / MISS
         land in `resolved` and clear `pending`; HIT_PENDING / RETRY park
         in `pending` for a later serve. Newly-HIT keys are pinned in one
         batch via `_pin_and_register_hits` and also returned (for
@@ -532,19 +532,19 @@ class ServerRole:
         a de-duplicated `keys` collection.
         """
         new_hits: list[OffloadKey] = []
-        for h in keys:
-            if h in lookup.resolved:
-                continue
-            result = parent.lookup(h, lookup.ctx)
-            if result is LookupResult.HIT:
-                new_hits.append(h)
-                lookup.resolved[h] = True
-                lookup.pending.discard(h)
-            elif result is LookupResult.MISS:
-                lookup.resolved[h] = False
-                lookup.pending.discard(h)
-            else:
-                lookup.pending.add(h)
+        unresolved = [h for h in dict.fromkeys(keys) if h not in lookup.resolved]
+        if unresolved:
+            results = parent.lookup(unresolved, None, lookup.ctx)
+            for h, result in zip(unresolved, results):
+                if result is LookupResult.HIT:
+                    new_hits.append(h)
+                    lookup.resolved[h] = True
+                    lookup.pending.discard(h)
+                elif result is LookupResult.MISS:
+                    lookup.resolved[h] = False
+                    lookup.pending.discard(h)
+                else:
+                    lookup.pending.add(h)
         if new_hits:
             self._pin_and_register_hits(lookup, new_hits, parent)
         return new_hits

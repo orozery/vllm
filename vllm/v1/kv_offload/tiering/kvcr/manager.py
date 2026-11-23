@@ -7,7 +7,7 @@ import mmap
 import socket
 import time
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -192,10 +192,11 @@ class _FrameworkPinAdapter:
         try:
             parent.on_new_request(req_context)
             started = True
+            hit_results = parent.lookup(offload_keys, None, req_context)
             hit_keys = tuple(
                 key
-                for key in offload_keys
-                if parent.lookup(key, req_context) is LookupResult.HIT
+                for key, result in zip(offload_keys, hit_results)
+                if result is LookupResult.HIT
             )
             if not hit_keys:
                 return None
@@ -492,14 +493,24 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._jobs_by_op: dict[OpHandle, _JobState] = {}
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        block_key = self._key_adapter.decode_from_framework(key)
-        status, _ = self._kvcr.query((block_key,), req_context.req_id)[0]
-        if status is QueryStatus.FETCHING:
-            return LookupResult.RETRY
-        if status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
-            return LookupResult.HIT
-        return LookupResult.MISS
+    def lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        positions: Sequence[int] | None,
+        req_context: ReqContext,
+    ) -> Sequence[LookupResult]:
+        if not keys:
+            return []
+        block_keys = tuple(self._key_adapter.decode_from_framework(key) for key in keys)
+        results: list[LookupResult] = []
+        for status, _ in self._kvcr.query(block_keys, req_context.req_id):
+            if status is QueryStatus.FETCHING:
+                results.append(LookupResult.RETRY)
+            elif status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
+                results.append(LookupResult.HIT)
+            else:
+                results.append(LookupResult.MISS)
+        return results
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:

@@ -372,9 +372,13 @@ class RequestOffloadState:
             num = min(num, self.req.num_prompt_tokens)
         return num
 
-    def register_boundary_key(self, group_idx: int, boundary_tokens: int) -> OffloadKey:
+    def boundary_key(self, group_idx: int, boundary_tokens: int) -> OffloadKey:
+        """Build a partial-tail boundary key without recording its position."""
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
-        key = make_offload_key(self.req.block_hashes[hash_idx], group_idx)
+        return make_offload_key(self.req.block_hashes[hash_idx], group_idx)
+
+    def register_boundary_key(self, group_idx: int, boundary_tokens: int) -> OffloadKey:
+        key = self.boundary_key(group_idx, boundary_tokens)
         self.req_context.set_offload_key_position(key, boundary_tokens)
         return key
 
