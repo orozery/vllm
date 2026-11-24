@@ -563,6 +563,7 @@ class SingleDirectionOffloadingHandler:
         job_id: int,
         device_ptrs: DevicePointers,
         cpu_spec: BlockIDsLoadStoreSpec,
+        wait_compute: bool = True,
     ) -> bool:
         cpu_blocks = cpu_spec.block_ids
         assert cpu_blocks.ndim == 1
@@ -636,7 +637,11 @@ class SingleDirectionOffloadingHandler:
         # the step that allocates it for the load and cannot retract zeroing
         # shipped in an earlier step for a since-reallocated block; with async
         # scheduling nothing else orders that zeroing against this copy.
-        stream.wait_stream(current_platform.current_stream())
+        # A store whose source data was written two or more steps ago is
+        # already ordered by stream FIFO, so the caller may skip this wait and
+        # let the copy overlap the previous step's forward.
+        if wait_compute:
+            stream.wait_stream(current_platform.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
@@ -760,6 +765,14 @@ class SingleDirectionOffloadingHandler:
                         "for it to complete",
                         job_id,
                     )
+
+    def fence_stream(self, job_ids: set[int]) -> None:
+        """Order the current device stream after these transfers."""
+        stream = current_platform.current_stream()
+        for job_id in job_ids:
+            event = self._transfer_events.get(job_id)
+            if event is not None:
+                stream.wait_event(event)
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
@@ -956,11 +969,17 @@ class CPUOffloadingWorker(OffloadingWorker):
         self._ready.set()
 
     def submit_store(
-        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        device_ptrs: DevicePointers,
+        dst_spec: LoadStoreSpec,
+        wait_compute: bool = True,
     ) -> bool:
         """Async GPU -> CPU."""
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-        return self._store_handler.transfer_async(job_id, device_ptrs, dst_spec)
+        return self._store_handler.transfer_async(
+            job_id, device_ptrs, dst_spec, wait_compute=wait_compute
+        )
 
     def submit_load(
         self,
@@ -985,6 +1004,9 @@ class CPUOffloadingWorker(OffloadingWorker):
         self._store_handler.wait(job_ids)
         self._load_handler.wait(job_ids)
         self._expedited_load_handler.wait(job_ids)
+
+    def fence_stream(self, job_ids: set[int]) -> None:
+        self._store_handler.fence_stream(job_ids)
 
     def shutdown(self) -> None:
         # The region must outlive the setup thread that touches it.

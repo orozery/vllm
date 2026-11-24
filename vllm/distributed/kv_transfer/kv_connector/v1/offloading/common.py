@@ -64,6 +64,11 @@ class TransferJob:
     dst_spec: LoadStoreSpec
     # Load only: completed before this step's forward pass.
     sync: bool = False
+    # Scheduler step that produced the data this store reads. The worker may
+    # start the copy without waiting for the compute stream when that step is
+    # old enough that its kernels must have finished. -1 means the data is
+    # already complete (for example, a load that finished).
+    record_step: int = -1
 
 
 @dataclass(slots=True)
@@ -97,6 +102,10 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     jobs_to_flush: set[int] | None = None
     # False until every worker reported ready under async_init.
     offloading_enabled: bool = True
+    # Scheduler step this metadata was built for. Monotonic within an engine.
+    # Workers compare it with TransferJob.record_step to decide whether a
+    # store's source data is old enough to copy without a compute-stream wait.
+    step: int = 0
 
 
 @dataclass

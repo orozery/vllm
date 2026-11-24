@@ -178,7 +178,11 @@ class MockOffloadingWorker(OffloadingWorker):
         return finished
 
     def submit_store(
-        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        device_ptrs: DevicePointers,
+        dst_spec: LoadStoreSpec,
+        wait_compute: bool = True,
     ) -> bool:
         gpu_spec = self._gpu_spec_map.pop(id(device_ptrs))
         self.transfer_specs[job_id] = (gpu_spec, dst_spec)
@@ -213,6 +217,12 @@ class MockOffloadingWorker(OffloadingWorker):
                 self.completed_transfers.append(result)
 
     def wait(self, job_ids: set[int]) -> None:
+        self.flushed_jobs |= job_ids
+        self.complete_jobs(job_ids)
+
+    def fence_stream(self, job_ids: set[int]) -> None:
+        # No device stream in this double: completing the jobs here keeps the
+        # same observable behavior as the blocking wait it replaces.
         self.flushed_jobs |= job_ids
         self.complete_jobs(job_ids)
 

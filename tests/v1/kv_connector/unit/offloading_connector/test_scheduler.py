@@ -3585,13 +3585,18 @@ def _make_lazy_runner_with_groups(
     runner.manager.prepare_store.side_effect = prepare_store
     flushed_job_ids: list[int] = []
     handler = runner.offloading_spec.handler
-    wait = handler.wait
+    wait, fence_stream = handler.wait, handler.fence_stream
 
     def record_wait(job_ids):
         flushed_job_ids.extend(job_ids)
         wait(job_ids)
 
+    def record_fence(job_ids):
+        flushed_job_ids.extend(job_ids)
+        fence_stream(job_ids)
+
     handler.wait = record_wait
+    handler.fence_stream = record_fence
     return runner, offers, flushed_job_ids
 
 
@@ -4291,17 +4296,26 @@ def test_lazy_load_target_is_flushed_before_load(
 
     handler = runner.offloading_spec.handler
     worker_calls: list[str] = []
-    wait, submit_load = handler.wait, handler.submit_load
+    wait, fence_stream, submit_load = (
+        handler.wait,
+        handler.fence_stream,
+        handler.submit_load,
+    )
 
     def record_wait(job_ids):
         worker_calls.append("flush")
         wait(job_ids)
+
+    def record_fence(job_ids):
+        worker_calls.append("flush")
+        fence_stream(job_ids)
 
     def record_submit_load(job_id, src_spec, dst_spec):
         worker_calls.append("load")
         return submit_load(job_id, src_spec, dst_spec)
 
     handler.wait = record_wait
+    handler.fence_stream = record_fence
     handler.submit_load = record_submit_load
     # All the free blocks belong to the first request.
     offers.clear()

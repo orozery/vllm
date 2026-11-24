@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +57,10 @@ class GpuChunk:
     block_ids: tuple[int, ...]
     # The key of the data in each block of block_ids, or None for a null block.
     block_keys: tuple[OffloadKey | None, ...]
+    # The scheduler step that produced this chunk's data. -1 means the data
+    # arrived by a load that already completed, so it is safe to copy without
+    # a compute-stream wait.
+    record_step: int = field(default=-1, compare=False)
 
 
 class OverwriteMap:
@@ -197,6 +201,8 @@ class OnOverwriteStoreHandler(StoreTriggerHandler):
         # for new data, for the blocks given out in this step. Rebuilt every
         # step, in on_request_blocks_allocated and on_blocks_allocated.
         self._allocated_block_keys: dict[int, OffloadKey | None] = {}
+        # The scheduler step being built; set in build_store_jobs.
+        self._step: int = 0
 
     @override
     def on_request_blocks_allocated(
@@ -235,6 +241,7 @@ class OnOverwriteStoreHandler(StoreTriggerHandler):
         sink: StoreJobSink,
     ) -> None:
         """Record this step's chunks, then store the chunks it overwrites."""
+        self._step = sink.step
         # Record the computed chunks before the overwritten ones, so a request
         # that finishes in this step can offer a chunk on a block that the
         # pool gives out in the same step.
@@ -365,6 +372,7 @@ class OnOverwriteStoreHandler(StoreTriggerHandler):
                     chunk_idx,
                     key,
                     req_status.group_states[config_idx].block_ids,
+                    record_step=self._step,
                 )
                 for key, (config_idx, chunk_idx) in zip(
                     candidates.keys, candidates.key_chunks
@@ -385,6 +393,7 @@ class OnOverwriteStoreHandler(StoreTriggerHandler):
         chunk_idx: int,
         key: OffloadKey,
         group_block_ids: Sequence[int],
+        record_step: int = -1,
     ) -> GpuChunk:
         """The chunk at a position, with 0 for each null GPU block."""
         start = chunk_idx * self._config.blocks_per_chunk
@@ -399,6 +408,7 @@ class OnOverwriteStoreHandler(StoreTriggerHandler):
                 block_key(req, group_config, idx) if group_block_ids[idx] else None
                 for idx in block_idxs
             ),
+            record_step=record_step,
         )
 
     def _build_overwrite_store_jobs(self, sink: StoreJobSink) -> None:
@@ -429,6 +439,9 @@ class OnOverwriteStoreHandler(StoreTriggerHandler):
             keys=[chunk.key for chunk in accepted],
             src_spec=self._batch_src_spec(accepted),
             dst_spec=store_output.store_spec,
+            # The newest data in the batch sets the dependency: the copy may
+            # start only once that step's kernels have finished.
+            record_step=max(chunk.record_step for chunk in accepted),
         )
 
     def _batch_src_spec(self, chunks: list[GpuChunk]) -> GPULoadStoreSpec:

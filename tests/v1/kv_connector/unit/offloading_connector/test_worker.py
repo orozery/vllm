@@ -272,7 +272,7 @@ def test_handle_preemptions_non_writer_acks_flushed_store():
 
     assert worker.worker is not None
     worker.worker.submit_store.assert_not_called()
-    worker.worker.wait.assert_called_once_with({10})
+    worker.worker.fence_stream.assert_called_once_with({10})
     assert metadata.store_jobs == {}
     meta = worker.build_connector_worker_meta()
     assert meta is not None

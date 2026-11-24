@@ -183,6 +183,10 @@ class _StoreJobSink:
         self._trigger = trigger
         self.jobs: dict[int, TransferJob] = {}
 
+    @property
+    def step(self) -> int:
+        return self._scheduler.step
+
     def prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext | None
     ) -> PrepareStoreOutput | None:
@@ -207,6 +211,7 @@ class _StoreJobSink:
         *,
         fenced_block_ids: list[int] | None = None,
         deferred_fence_block_ids: list[int] | None = None,
+        record_step: int | None = None,
     ) -> None:
         job_id = self._scheduler._track_store_job(
             req_id,
@@ -216,7 +221,10 @@ class _StoreJobSink:
             deferred_fence_block_ids=deferred_fence_block_ids,
         )
         self.jobs[job_id] = TransferJob(
-            req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
+            req_id=req_id,
+            src_spec=src_spec,
+            dst_spec=dst_spec,
+            record_step=self.step if record_step is None else record_step,
         )
 
 
@@ -307,6 +315,10 @@ class OffloadingConnectorScheduler:
 
         # Job ID counter shared by loads and stores.
         self._job_counter: int = 0
+        # Scheduler step counter. The worker compares it with a store job's
+        # record_step to decide whether the copy may start without waiting for
+        # the compute stream.
+        self.step: int = 0
         # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
         # active jobs.
         self._stale_job_threshold: int = 0
@@ -1412,6 +1424,7 @@ class OffloadingConnectorScheduler:
     ) -> KVConnectorMetadata:
         # Every step reaches here, including the empty steps a held fence
         # keeps the engine taking when no request is left.
+        self.step += 1
         if (
             self._reset_fence
             and time.monotonic() - self._reset_fence_since > _RESET_FENCE_WARN_S
@@ -1479,6 +1492,7 @@ class OffloadingConnectorScheduler:
             store_jobs=store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
             offloading_enabled=self._offloading_enabled,
+            step=self.step,
         )
 
         # All prepare_store calls for finished requests have been issued.

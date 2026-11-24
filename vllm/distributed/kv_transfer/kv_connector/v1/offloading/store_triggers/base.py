@@ -48,6 +48,11 @@ class StoreJobSink(Protocol):
         """Count a store attempt whose keys are not offered again."""
         ...
 
+    @property
+    def step(self) -> int:
+        """The scheduler step that is building these jobs."""
+        ...
+
     def add_job(
         self,
         req_id: ReqId | None,
@@ -57,8 +62,14 @@ class StoreJobSink(Protocol):
         *,
         fenced_block_ids: list[int] | None = None,
         deferred_fence_block_ids: list[int] | None = None,
+        record_step: int | None = None,
     ) -> None:
-        """Make a store job, and let the scheduler track it."""
+        """Make a store job, and let the scheduler track it.
+
+        `record_step` is the step that produced the data the job reads. It
+        defaults to the current step, which is right for a job created for a
+        chunk as the model computes it.
+        """
         ...
 
 

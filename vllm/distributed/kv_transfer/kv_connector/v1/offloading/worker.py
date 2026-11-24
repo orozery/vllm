@@ -62,8 +62,14 @@ class OffloadingConnectorWorker:
         self._load_jobs: dict[int, ReqId | None] = {}
         self._failed_recving: set[ReqId] = set()
         self._unsubmitted_store_jobs: list[
-            tuple[int, GPULoadStoreSpec, LoadStoreSpec]
+            tuple[int, GPULoadStoreSpec, LoadStoreSpec, int]
         ] = []
+        # A store may skip the compute-stream wait once its record step is this
+        # far behind. At pre_forward of step K the newest enqueued compute is
+        # step K-1's forward, so stream FIFO guarantees that step K-2 and older
+        # have finished. Two steps of age is therefore enough, independent of
+        # the async scheduling depth.
+        self._record_safe_age = 2
         self._connector_worker_meta = OffloadingWorkerMetadata()
         # Under async_init, report readiness once.
         self._report_ready = self.spec.async_init
@@ -225,11 +231,32 @@ class OffloadingConnectorWorker:
 
         self._init_worker(canonical_kv_caches)
 
+    def _submit_store(
+        self,
+        job_id: int,
+        src_spec: GPULoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+        record_step: int,
+        step: int,
+    ) -> None:
+        device_ptrs = resolve_device_pointers(src_spec, self._kv_caches)
+        # The copy reads data the model wrote. When that step is old enough,
+        # stream FIFO already orders the reads after the writes, so the copy
+        # may start now and overlap the step in flight. Otherwise it waits for
+        # the compute stream, as a store always did.
+        wait_compute = not (
+            record_step < 0 or step - record_step >= self._record_safe_age
+        )
+        success = self.worker.submit_store(
+            job_id, device_ptrs, dst_spec, wait_compute=wait_compute
+        )
+        assert success
+
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
 
         # Pop jobs_to_flush from store_jobs into _unsubmitted_store_jobs
-        # so the existing submission loop below submits them before wait().
+        # so the submission loop below submits them before fencing.
         if kv_connector_metadata.jobs_to_flush:
             for job_id in kv_connector_metadata.jobs_to_flush:
                 entry = kv_connector_metadata.store_jobs.pop(job_id, None)
@@ -239,30 +266,36 @@ class OffloadingConnectorWorker:
                         continue
                     assert isinstance(entry.src_spec, GPULoadStoreSpec)
                     self._unsubmitted_store_jobs.append(
-                        (job_id, entry.src_spec, entry.dst_spec)
+                        (job_id, entry.src_spec, entry.dst_spec, entry.record_step)
                     )
 
         # Submit deferred stores from previous step (and jobs_to_flush above).
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+        for job_id, src_spec, dst_spec, record_step in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
-            device_ptrs = resolve_device_pointers(src_spec, self._kv_caches)
-            success = self.worker.submit_store(job_id, device_ptrs, dst_spec)
-            assert success
+            self._submit_store(
+                job_id, src_spec, dst_spec, record_step, kv_connector_metadata.step
+            )
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
-            self.worker.wait(kv_connector_metadata.jobs_to_flush)
+            # The new owner writes these blocks in this step, so the forward
+            # must be ordered after the copies. Order it on the device stream
+            # instead of blocking the host: the host wait delayed the engine
+            # for a copy it could not overlap.
+            self.worker.fence_stream(kv_connector_metadata.jobs_to_flush)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         if not metadata.offloading_enabled:
             assert not metadata.store_jobs and not metadata.load_jobs
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+        submitted_store_jobs: set[int] = set()
+        for job_id, src_spec, dst_spec, record_step in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
-            device_ptrs = resolve_device_pointers(src_spec, self._kv_caches)
-            success = self.worker.submit_store(job_id, device_ptrs, dst_spec)
-            assert success
+            self._submit_store(job_id, src_spec, dst_spec, record_step, metadata.step)
+            submitted_store_jobs.add(job_id)
         self._unsubmitted_store_jobs.clear()
+        if submitted_store_jobs:
+            self.worker.fence_stream(submitted_store_jobs)
 
         sync_job_ids: set[int] = set()
         for job_id, entry in metadata.load_jobs.items():
@@ -293,7 +326,7 @@ class OffloadingConnectorWorker:
             # to token sampling, thereby avoiding delays to token generation.
             assert isinstance(entry.src_spec, GPULoadStoreSpec)
             self._unsubmitted_store_jobs.append(
-                (job_id, entry.src_spec, entry.dst_spec)
+                (job_id, entry.src_spec, entry.dst_spec, entry.record_step)
             )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:

@@ -98,7 +98,11 @@ class FSOffloadingWorker(OffloadingWorker):
         """Release backend resources (e.g. cuFileDriverClose)."""
 
     def submit_store(
-        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        device_ptrs: DevicePointers,
+        dst_spec: LoadStoreSpec,
+        wait_compute: bool = True,
     ) -> bool:
         assert isinstance(dst_spec, FSLoadStoreSpec)
         completions, num_bytes = self._submit_io(

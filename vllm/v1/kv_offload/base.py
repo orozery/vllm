@@ -769,9 +769,18 @@ class OffloadingWorker(ABC):
 
     @abstractmethod
     def submit_store(
-        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        device_ptrs: DevicePointers,
+        dst_spec: LoadStoreSpec,
+        wait_compute: bool = True,
     ) -> bool:
-        """Async device -> offloaded medium."""
+        """Async device -> offloaded medium.
+
+        `wait_compute=False` promises that the source data was written by an
+        earlier engine step, so the copy may start without waiting for the
+        compute stream. Workers that have no compute stream ignore it.
+        """
 
     @abstractmethod
     def submit_load(
@@ -792,6 +801,15 @@ class OffloadingWorker(ABC):
 
     @abstractmethod
     def wait(self, job_ids: set[int]) -> None: ...
+
+    def fence_stream(self, job_ids: set[int]) -> None:
+        """Order the current device stream after these transfers.
+
+        Used instead of `wait()` when the device stream, rather than the host,
+        must wait for a transfer. Workers with no device stream fall back to
+        blocking the host.
+        """
+        self.wait(job_ids)
 
     def start_deferred_setup(self) -> None:
         """Start setup deferred by async_init.
