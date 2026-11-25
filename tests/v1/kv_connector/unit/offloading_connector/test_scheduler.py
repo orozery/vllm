@@ -1500,8 +1500,9 @@ def test_shared_prefix_junction_is_not_lowered():
     assert request.shared_prefix_boundary == 24
 
 
-def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
-    """A pending chunk outside the converged hit must not hide the junction."""
+def _make_pending_attention_scheduler():
+    """Full attention readable to 32 with its third chunk pending; two
+    window-16 sparse groups cut the converged hit to 16."""
     config = create_vllm_config(
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
@@ -1544,10 +1545,29 @@ def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
         is not None
     )
     assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+    return scheduler, request, manager, producer, pending
+
+
+def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
+    """A pending chunk outside the converged hit must not hide the junction."""
+    scheduler, request, manager, producer, pending = _make_pending_attention_scheduler()
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
     assert request.shared_prefix_boundary == 32
     assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+
+
+def test_pending_attention_bounds_the_junction_not_the_tail_search():
+    """The split behind the junction: a pending chunk caps the readable prefix
+    the junction may use, but not the boundary the partial-tail search reaches."""
+    scheduler, request, _, _, _ = _make_pending_attention_scheduler()
+    req_status = scheduler._req_status[request.request_id]
+    req_status.update_offload_keys()
+
+    probe = scheduler_module._LookupProbe()
+    hit, search_boundary = scheduler._lookup_complete_chunks(req_status, None, probe)
+    assert (hit, search_boundary) == (16, 48)
+    assert probe.confirmed_fa_boundary == 32
 
 
 def test_unconfirmed_attention_does_not_register_junction():
@@ -1748,14 +1768,12 @@ def test_external_cache_hit_sources_preserve_partial_tail_origin(
     _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
     assert scheduler._lookup(req_status) == 28
 
-    def get_load_source(key, req_context):
+    def source_for(key, req_context):
         if get_offload_group_idx(key) == 1:
             assert recurrent_source is not None
             return recurrent_source
         block_hash = get_offload_block_hash(key)
         return "p2p" if block_hash == b"h3" else "host"
-
-    _as_mock(scheduler.manager.get_load_source).side_effect = get_load_source
 
     recurrent_block = KVCacheBlock(41)
     if recurrent_source is None:
@@ -1772,6 +1790,10 @@ def test_external_cache_hit_sources_preserve_partial_tail_origin(
         ),
         num_external_tokens=28,
     )
+    req_status.load_sources = {
+        key: source_for(key, req_status.req_context)
+        for _, _, key in req_status.load_key_ranges
+    }
     assert req_status.partial_tail_boundary is None
     assert scheduler.get_external_cache_hit_sources(request, 28) == expected
 
@@ -1822,16 +1844,21 @@ def test_external_cache_hit_sources_reconcile_different_group_chunk_sizes(
             for chunk_idx in range(2 // (group_idx + 1))
         ]
     scheduler._req_status[request.request_id] = req_status
-    runner.manager.get_load_source.side_effect = lambda key, req_context: (
-        ("host" if get_offload_block_hash(key) == b"h0" else "disk")
-        if get_offload_group_idx(key) == 0
-        else second_source
-    )
+
+    def source_for(key, req_context):
+        if get_offload_group_idx(key) != 0:
+            return second_source
+        return "host" if get_offload_block_hash(key) == b"h0" else "disk"
+
     scheduler.update_state_after_alloc(
         request,
         KVCacheBlocks(([KVCacheBlock(1), KVCacheBlock(2)], [KVCacheBlock(3)])),
         2 * block_size,
     )
+    req_status.load_sources = {
+        key: source_for(key, req_status.req_context)
+        for _, _, key in req_status.load_key_ranges
+    }
 
     assert scheduler.get_external_cache_hit_sources(request, 2 * block_size) == expected
 
@@ -1864,13 +1891,29 @@ def test_external_cache_hit_sources_range_boundaries(ranges, expected):
     for idx, (lo, hi, _) in enumerate(ranges):
         key = make_offload_key(str(idx).encode(), 0)
         state.load_key_ranges.append((lo, hi, key))
-    _as_mock(scheduler.manager.get_load_source).side_effect = lambda key, ctx: ranges[
-        int(get_offload_block_hash(key))
-    ][2]
+    state.load_sources = {
+        key: ranges[int(get_offload_block_hash(key))][2]
+        for _, _, key in state.load_key_ranges
+    }
 
     result = scheduler.get_external_cache_hit_sources(request, 12)
     assert result == expected
     assert sum(result.values()) == 12
+
+
+def test_external_cache_hit_sources_prefer_the_commit_map():
+    """The connector uses the map commit_hits returned, not a manager round-trip."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    state = scheduler._req_status[request.request_id]
+    state.num_locally_computed_tokens = 0
+    key = make_offload_key(b"h3", 0)
+    state.load_key_ranges.append((0, 16, key))
+    state.load_sources = {key: CacheHitSource.DISK}
+
+    assert scheduler.get_external_cache_hit_sources(request, 16) == {
+        CacheHitSource.DISK: 16
+    }
 
 
 @pytest.mark.parametrize("source", ["host", "disk", "p2p", "external_unspecified"])
@@ -1884,7 +1927,6 @@ def test_external_cache_hit_sources_recurrent_only_state(source):
     state.update_offload_keys()
     _as_mock(scheduler.manager.lookup).return_value = LookupResult.HIT
     assert scheduler._lookup(state) == 48
-    _as_mock(scheduler.manager.get_load_source).return_value = source
     scheduler.update_state_after_alloc(
         request,
         KVCacheBlocks(
@@ -1898,10 +1940,12 @@ def test_external_cache_hit_sources_recurrent_only_state(source):
         ),
         48,
     )
+    state.load_sources = dict.fromkeys(
+        (key for _, _, key in state.load_key_ranges), source
+    )
     assert scheduler.get_external_cache_hit_sources(request, 48) == {
         CacheHitSource(source): 48
     }
-    _as_mock(scheduler.manager.get_load_source).assert_called_once()
 
 
 @pytest.mark.parametrize("sparse_kind", ["sliding", "chunked_local"])
@@ -1970,7 +2014,7 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
             ]
         )
 
-    def get_load_source(key, req_context):
+    def source_for(key, req_context):
         chunk_idx = int(get_offload_block_hash(key))
         if get_offload_group_idx(key) == len(groups) - 1:
             assert chunk_idx >= 2  # Earlier sparse keys were not loaded.
@@ -1979,11 +2023,14 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
             return sparse_source
         return "host"
 
-    _as_mock(scheduler.manager.get_load_source).side_effect = get_load_source
     count = 4 * chunk_size - local_tokens
     scheduler.update_state_after_alloc(
         request, KVCacheBlocks(tuple(block_groups)), count
     )
+    req_status.load_sources = {
+        key: source_for(key, req_status.req_context)
+        for _, _, key in req_status.load_key_ranges
+    }
     expected: dict[CacheHitSource, int] = {}
 
     def expect(source: CacheHitSource, num_tokens: int) -> None:
@@ -2130,6 +2177,180 @@ def test_partial_lookup_defers_only_for_viable_pending_boundary(
 
 
 @pytest.mark.cpu_test
+def test_committed_plan_is_rechecked_without_rewalking():
+    """A deferred plan re-checks only its keys; a changed input re-plans."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+    walks = 0
+
+    def walk(req_status, max_new=None, probe=None):
+        nonlocal walks
+        walks += 1
+        return 10
+
+    scheduler._lookup = walk
+
+    # Commit, but the set is not readable yet: defer without re-walking.
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.HIT_PENDING
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert walks == 1
+    assert scheduler._req_status["req"].committed_plan
+
+    # Same inputs and now readable: report the committed result, no re-walk.
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (10, True)
+    assert walks == 1
+
+    # A changed token cap invalidates the plan and re-walks.
+    assert scheduler.get_num_new_matched_tokens(request, 0, max_num_new_tokens=4) == (
+        10,
+        True,
+    )
+    assert walks == 2
+    scheduler.manager.commit_hits.assert_any_call(
+        (), scheduler._req_status["req"].req_context
+    )
+
+
+@pytest.mark.cpu_test
+def test_deferred_load_keeps_its_plan_live():
+    """An accepted async load whose callback the core defers keeps its plan
+    live, so the end-of-step hook does not release the pins it will rely on."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.committed_plan is not None
+    output = MagicMock()
+    output.num_scheduled_tokens = {}
+
+    # Waiting for device blocks: the plan is not live.
+    request.status = RequestStatus.WAITING
+    assert scheduler._live_plan_req_ids(output) == set()
+
+    # The load was accepted; only its deferred callback is outstanding.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._live_plan_req_ids(output) == {"req"}
+
+
+@pytest.mark.cpu_test
+def test_unconverged_lookup_defers_before_commit():
+    """A key the walk did not confirm that is still converging defers the
+    request instead of refusing the whole committed set."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+
+    # The walk reports a hit but confirms no key, so every key is re-checked.
+    def walk(req_status, max_new=None, probe=None):
+        return 10
+
+    scheduler._lookup = walk
+    manager = scheduler.manager
+    manager.lookup.side_effect = None
+    manager.lookup.return_value = LookupResult.RETRY
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    manager.commit_hits.assert_not_called()
+
+    manager.lookup.return_value = LookupResult.HIT
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] == 10
+    manager.commit_hits.assert_called_once()
+
+
+@pytest.mark.cpu_test
+def test_committed_plan_defers_while_a_key_is_loading():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    scheduler._chunks_being_loaded = set(plan.keys)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+
+
+@pytest.mark.cpu_test
+def test_ready_plan_recommits_to_repin():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    manager = scheduler.manager
+
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    _as_mock(manager.commit_hits).reset_mock()
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    _as_mock(manager.commit_hits).assert_called_once_with(
+        plan.keys, req_status.req_context
+    )
+
+
+@pytest.mark.cpu_test
+def test_committed_plan_repairs_an_evicted_key():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    manager = scheduler.manager
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    manager.lookup.side_effect = None
+    manager.lookup.return_value = LookupResult.MISS
+    manager.commit_hits.reset_mock()
+    manager.commit_hits.return_value = dict.fromkeys(plan.keys, CacheHitSource.HOST)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    manager.commit_hits.assert_called_once_with(plan.keys, req_status.req_context)
+    assert req_status.committed_plan is plan
+
+
+@pytest.mark.cpu_test
+def test_no_commit_when_lookup_finds_no_hits():
+    """A request with no hits must not reach the manager's commit."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.MISS
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    scheduler.manager.commit_hits.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_zero_external_tokens_releases_plan_without_prepare_load():
+    """No hits means no load: release a committed plan, never prepare one."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    prepare_load = MagicMock(wraps=scheduler.manager.prepare_load)
+    scheduler.manager.prepare_load = prepare_load
+    commit_hits = scheduler.manager.commit_hits
+
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.committed_plan is not None
+    commit_hits.reset_mock()
+    prepare_load.reset_mock()
+
+    # Core dropped the hit (for example the local partial tail won).
+    scheduler.update_state_after_alloc(request, KVCacheBlocks(()), 0)
+
+    commit_hits.assert_called_once_with((), req_status.req_context)
+    prepare_load.assert_not_called()
+    assert req_status.committed_plan is None
+
+
+@pytest.mark.cpu_test
 def test_partial_lookup_requires_resident_full_attention_prefix():
     # Tail keys resident but the chunk [0,16) was evicted: reporting the tail
     # would make the load request a missing chunk.
@@ -2162,9 +2383,10 @@ def test_partial_lookup_defers_while_anchor_chunk_is_loading():
 
 
 @pytest.mark.cpu_test
-def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
-    # Like the complete-chunk lookup, a full-attention chunk that is still
-    # being stored does not defer the request; the tail is not reported.
+def test_partial_lookup_finds_a_tail_above_a_pending_anchor_chunk():
+    # The full-attention anchor chunk is present but not readable yet. The tail
+    # beyond it is still found; the commit then defers until the plan's chunks,
+    # including that anchor, are readable.
     scheduler = _make_partial_tail_scheduler()
     _, req_status = _make_anchored_partial_tail_request(
         scheduler, {0: {b"h6"}, 1: {b"h6"}}
@@ -2177,8 +2399,8 @@ def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
         return resident(key, req_context)
 
     scheduler.manager.lookup.side_effect = lookup
-    assert scheduler._lookup(req_status) == 0
-    assert req_status.partial_tail_boundary is None
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.partial_tail_boundary == 28
 
 
 @pytest.mark.cpu_test
@@ -3338,6 +3560,9 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
         generate_store_output([])
     )
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    # The commit's readiness re-check consults the manager; a stubbed walk
+    # must also report the keys readable.
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
 
     # single block lookup with a hit in a middle block
@@ -3399,6 +3624,7 @@ def test_small_hit_loads_synchronously(request_runner, async_scheduling: bool):
     store_none()
     matched.clear()
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.new_request(token_ids=[0] * tokens_per_chunk + [1] * tokens_per_chunk)
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
@@ -3489,6 +3715,7 @@ def test_request_preemption(request_runner, async_scheduling: bool, cpu_hit: boo
         # request should now return from preemption
         # re-load [0, ..., 8] from the CPU and store [9, 10, 11]
         runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 3
+        runner.manager.lookup.return_value = LookupResult.HIT
         runner.run(
             decoded_tokens=[0] * block_size,
             expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
@@ -3807,6 +4034,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
@@ -3819,6 +4047,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     # start a new request to load the same first block
     runner.new_request(token_ids=[0] * tokens_per_chunk)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
@@ -3871,6 +4100,7 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
@@ -4254,7 +4484,9 @@ def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
 # which is what widens the demanded set. A new member has to be added here.
 _SCAN_BEHAVIOR = {
     LookupResult.HIT: (1, 3),
-    LookupResult.HIT_PENDING: (1, None),
+    # Present and committed like a hit; only its readability is deferred,
+    # which the commit/readiness step handles, not the scan.
+    LookupResult.HIT_PENDING: (1, 3),
     LookupResult.RETRY: (3, None),
     LookupResult.MISS: (3, 0),
 }
@@ -4279,14 +4511,15 @@ def test_scan_behavior_declared_for_every_lookup_result(result: LookupResult):
     [
         (LookupResult.MISS, 2),
         (LookupResult.RETRY, None),
-        (LookupResult.HIT_PENDING, None),
+        (LookupResult.HIT_PENDING, 5),
         (LookupResult.HIT, 5),
     ],
 )
 def test_sliding_window_unaligned_initial_run(middle, expected):
     sched = _make_scheduler_with_lookup({3: middle}, default=LookupResult.HIT)
     # If the larger rightmost window misses, the earlier aligned window only
-    # needs the usual two chunks. Pending/uncertain keys must still defer.
+    # needs the usual two chunks. A pending key counts as present; only an
+    # unconverged (RETRY) lookup defers.
     assert (
         sched._sliding_window_lookup(
             to_keys([1, 2, 3, 4, 5]), 2, _EMPTY_REQ_CTX, initial_window_size=3
@@ -4341,23 +4574,19 @@ class TestMaximalPrefixLookup:
         sched = _make_scheduler_with_lookup({})
         assert _maximal_lookup(sched, []) == 0
 
-    @pytest.mark.parametrize(
-        "pending_result",
-        [LookupResult.RETRY, LookupResult.HIT_PENDING],
-    )
-    def test_pending_result_records_only_allocated_primary(
-        self,
-        pending_result: LookupResult,
-    ):
-        sched = _make_scheduler_with_lookup({1: pending_result})
+    def test_retry_records_nothing(self):
+        sched = _make_scheduler_with_lookup({1: LookupResult.RETRY})
 
         assert _maximal_lookup(sched, to_keys([1])) is None
-        if pending_result is LookupResult.HIT_PENDING:
-            _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
-                _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
-            )
-        else:
-            _as_mock(sched._events_tracker.record_lookup).assert_not_called()
+        _as_mock(sched._events_tracker.record_lookup).assert_not_called()
+
+    def test_hit_pending_records_like_a_hit(self):
+        sched = _make_scheduler_with_lookup({1: LookupResult.HIT_PENDING})
+
+        assert _maximal_lookup(sched, to_keys([1])) == 1
+        _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
+            _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
+        )
 
     def test_retry_defers(self):
         keys = to_keys([1, 2])
@@ -4386,12 +4615,12 @@ class TestMaximalPrefixLookup:
             keys[0],
         )
 
-    def test_hit_pending_defers(self):
+    def test_hit_pending_counts_as_hit(self):
         keys = to_keys([1, 2])
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT_PENDING, 2: LookupResult.HIT}
         )
-        assert _maximal_lookup(sched, keys) is None
+        assert _maximal_lookup(sched, keys) == 2
         assert _as_mock(sched.manager.lookup).call_count == 2
         assert _as_mock(sched._events_tracker.record_lookup).call_args_list == [
             call(_LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, i, key)
@@ -4399,11 +4628,11 @@ class TestMaximalPrefixLookup:
         ]
 
     def test_hit_pending_does_not_stop_scan(self):
-        """HIT_PENDING defers but does not break — scan continues until miss."""
+        """HIT_PENDING does not break — scan continues until miss."""
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT_PENDING, 2: LookupResult.MISS, 3: LookupResult.HIT}
         )
-        assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
+        assert _maximal_lookup(sched, to_keys([1, 2, 3])) == 1
         assert _as_mock(sched.manager.lookup).call_count == 2
         _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
             _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
@@ -4529,8 +4758,8 @@ class TestSlidingWindowLookup:
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT, 2: LookupResult.HIT_PENDING}
         )
-        # window=2: both count as hits, but defer_lookup is set
-        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) is None
+        # window=2: both count as hits; readability is deferred by commit.
+        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) == 2
 
     def test_hit_pending_does_not_break_streak(self):
         """HIT_PENDING in the middle of a window doesn't reset the streak."""
@@ -4538,9 +4767,7 @@ class TestSlidingWindowLookup:
             {1: LookupResult.HIT, 2: LookupResult.HIT_PENDING, 3: LookupResult.HIT}
         )
         # window=3: right-to-left finds 3(HIT),2(HIT_PENDING),1(HIT) = 3 consecutive
-        assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) is None
-        )
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -4702,6 +4929,7 @@ def test_request_level_policy_stores_all_blocks(request_runner, async_scheduling
     # New request with 2 offloaded chunks; first matches what's in CPU.
     runner.new_request(token_ids=[0] * tokens_per_chunk * 2)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output(keys)
     )
@@ -4733,6 +4961,7 @@ def test_loads_do_not_populate_fence_index(request_runner):
     )
     runner.new_request(token_ids=[0] * 12)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(decoded_tokens=[], complete_transfers=False)
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
 
@@ -4749,6 +4978,7 @@ def test_no_store_job_while_a_load_is_pending(request_runner):
     sched = runner.connector_scheduler
     runner.new_request(token_ids=[0] * 24)
     sched._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(decoded_tokens=[], complete_transfers=False)
 
     req_status = sched._req_status[str(runner.req_id)]
@@ -4803,6 +5033,7 @@ def test_fence_at_update_state_after_alloc(request_runner):
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * 4)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -5626,6 +5857,7 @@ def test_reset_cache(request_runner, async_scheduling: bool):
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -5785,6 +6017,7 @@ def test_prefix_cache_reset_preserves_same_step_offload_reload(
     assert request.status == RequestStatus.PREEMPTED
 
     runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.manager.lookup.return_value = LookupResult.HIT
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )

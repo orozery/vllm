@@ -414,7 +414,8 @@ class TestBackpressure:
             self._store_blocks(keys)
             # Pressure is on, so the cascade was skipped. Force-submit
             # a store job manually to get a completion to feed the EMA.
-            job_meta = self.manager.create_store_job(keys, _CTX)
+            job_meta = self.manager._claim(keys, _CTX).job
+            assert job_meta is not None
             job_meta.submit_time = time.monotonic() - 0.001
             self.tier.submit_store(job_meta)
             self.tier.release_jobs()
@@ -455,7 +456,8 @@ class TestBackpressure:
         for k in keys2:
             self.primary.prepare_store([k], _CTX, trigger=StoreTrigger.ON_COMPUTE)
             self.primary.complete_store([k], _CTX, trigger=StoreTrigger.ON_COMPUTE)
-        job_meta = self.manager.create_store_job(keys2, _CTX)
+        job_meta = self.manager._claim(keys2, _CTX).job
+        assert job_meta is not None
         job_meta.submit_time = time.monotonic() - mid_latency_s(len(keys2))
         self.tier.submit_store(job_meta)
         self.tier.release_jobs()

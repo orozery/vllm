@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections import Counter
-from collections.abc import Collection, Generator, Iterable, Sequence
+from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
@@ -27,7 +27,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _TransferMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.state import (
+    CommittedLoadPlan,
     GroupOffloadConfig,
+    LoadPlanInputs,
     RequestGroupState,
     RequestOffloadState,
     SchedulerOffloadConfig,
@@ -66,7 +68,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadAccessMode
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -76,6 +78,19 @@ _RESET_FENCE_WARN_S = 60
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
+
+
+@dataclass(slots=True)
+class _LookupProbe:
+    """What one lookup walk learned beyond the hit count."""
+
+    # Keys the walk saw readable.
+    ready_keys: set[OffloadKey] = field(default_factory=set)
+    # Leading readable chunks of the last full-attention scan.
+    confirmed_prefix: int = 0
+    # Readable tokens of the full-attention prefix. The tail search may extend
+    # past it, but the shared-prefix junction may not.
+    confirmed_fa_boundary: int | None = None
 
 
 def _parse_tier_filter(raw: Any) -> TierFilter:
@@ -479,29 +494,45 @@ class OffloadingConnectorScheduler:
         req: Request,
         group_config: GroupOffloadConfig,
         start_chunk_idx: int,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
         hit_count = 0
+        # Leading readable hits; a pending key does not confirm the junction.
+        confirmed_count = 0
+        confirming = True
         defer_lookup = False
         for local_idx, key in enumerate(keys):
             result = self.manager.lookup(key, req_context)
             match result:
                 case LookupResult.HIT | LookupResult.HIT_PENDING:
+                    # HIT_PENDING is present, just not readable yet. It counts
+                    # as a hit: the commit below starts its promotion, and the
+                    # request defers until the committed set is readable.
                     self._events_tracker.record_lookup(
                         req,
                         group_config,
                         start_chunk_idx + local_idx,
                         key,
                     )
+                    if result is LookupResult.HIT_PENDING:
+                        confirming = False
+                    else:
+                        if probe is not None:
+                            probe.ready_keys.add(key)
+                        if confirming:
+                            confirmed_count += 1
                     hit_count += 1
-                    defer_lookup |= result is LookupResult.HIT_PENDING
                 case LookupResult.RETRY:
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups (until a miss is detected).
+                    # Not converged. Don't break: keep scanning to let the
+                    # manager kick off async lookups (until a miss is seen).
+                    confirming = False
                     defer_lookup = True
                 case LookupResult.MISS:
                     break
+        if probe is not None:
+            probe.confirmed_prefix = confirmed_count
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -510,48 +541,46 @@ class OffloadingConnectorScheduler:
         sliding_window_size: int,
         req_context: ReqContext,
         initial_window_size: int | None = None,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
         The first run may need a larger window for a partial rightmost chunk.
-        Returns 0 on miss, None if the backend deferred a lookup."""
+        Returns 0 on miss, None if a lookup has not converged."""
         defer_lookup = False
-        pending_in_window = False
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
         for idx in range(len(keys) - 1, -1, -1):
             match self.manager.lookup(keys[idx], req_context):
                 case LookupResult.HIT:
+                    if probe is not None:
+                        probe.ready_keys.add(keys[idx])
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
-                    # Block is in cache, just not readable yet — counts
-                    # as hit for the consecutive streak. Don't break:
-                    # keep scanning to let manager kick off async lookups.
-                    pending_in_window = True
+                    # Present, just not readable yet; it counts as a hit and
+                    # the commit promotes it. Don't break: keep scanning to
+                    # let the manager kick off async lookups.
                     consecutive_hits += 1
                 case LookupResult.RETRY:
-                    # Block location uncertain — does not count as hit.
+                    # Lookup has not converged — does not count as hit.
                     # Don't break: keep scanning to let manager kick off
                     # async lookups.
                     defer_lookup = True
                     consecutive_hits = 0
-                    pending_in_window = False
                     required_window = sliding_window_size
                 case LookupResult.MISS:
                     consecutive_hits = 0
                     # This gap rules out the incomplete window to its right.
-                    pending_in_window = False
                     required_window = sliding_window_size
             if consecutive_hits == required_window:
-                return (
-                    None if defer_lookup or pending_in_window else idx + required_window
-                )
-        return None if defer_lookup or pending_in_window else consecutive_hits
+                return None if defer_lookup else idx + required_window
+        return None if defer_lookup else consecutive_hits
 
     def _lookup_complete_chunks(
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
+        probe: _LookupProbe | None = None,
     ) -> tuple[int | None, int | None]:
         """Find how many tokens beyond num_locally_computed_tokens can be loaded.
 
@@ -594,6 +623,8 @@ class OffloadingConnectorScheduler:
             state.lookup_hit_end_chunk_idx = 0
 
         full_attention_hit_boundary: int | None = None
+        # A pending chunk must not extend the shared-prefix junction.
+        confirmed_fa_boundary: int | None = None
         while lookup_groups:
             looked_up_sliding_window: bool = False
             full_attention_deferred = False
@@ -659,11 +690,27 @@ class OffloadingConnectorScheduler:
                         req_status.req,
                         group_config,
                         start_chunk_idx,
+                        probe,
                     )
                     full_attention_deferred |= num_hit_chunks is None
                     group_state.lookup_hit_end_chunk_idx = start_chunk_idx + (
                         num_hit_chunks or 0
                     )
+                    confirmed_prefix = (
+                        probe.confirmed_prefix
+                        if probe is not None
+                        else (num_hit_chunks or 0)
+                    )
+                    confirmed_chunks = start_chunk_idx + confirmed_prefix
+                    confirmed_tokens = tokens_per_chunk * confirmed_chunks
+                    if confirmed_fa_boundary is None:
+                        confirmed_fa_boundary = confirmed_tokens
+                    else:
+                        confirmed_fa_boundary = min(
+                            confirmed_fa_boundary, confirmed_tokens
+                        )
+                    if probe is not None:
+                        probe.confirmed_fa_boundary = confirmed_fa_boundary
                 else:
                     required_window = sliding_window_size_in_chunks
                     candidate_end = min(
@@ -679,6 +726,7 @@ class OffloadingConnectorScheduler:
                         required_window,
                         req_status.req_context,
                         initial_window,
+                        probe,
                     )
                 if num_hit_chunks == 0:
                     return 0, full_attention_hit_boundary
@@ -756,16 +804,28 @@ class OffloadingConnectorScheduler:
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
+        if probe is None:
+            probe = _LookupProbe()
         complete_hit, full_attention_hit_boundary = self._lookup_complete_chunks(
-            req_status, max_num_new_tokens
+            req_status, max_num_new_tokens, probe
         )
         num_hit_tokens = self._lookup_partial_tail_hit(
-            req_status, complete_hit, full_attention_hit_boundary, max_num_new_tokens
+            req_status,
+            complete_hit,
+            full_attention_hit_boundary,
+            max_num_new_tokens,
+            probe,
         )
-        if num_hit_tokens is not None and full_attention_hit_boundary is not None:
+        # The tail search may look past the readable prefix; the junction may
+        # not, since a pending chunk would pin state the recompute lacks.
+        junction_boundary = probe.confirmed_fa_boundary
+        if junction_boundary is None:
+            junction_boundary = full_attention_hit_boundary
+        if num_hit_tokens is not None and junction_boundary is not None:
             self._maybe_register_shared_prefix_junction(
-                req_status, full_attention_hit_boundary, num_hit_tokens
+                req_status, junction_boundary, num_hit_tokens
             )
         return num_hit_tokens
 
@@ -775,6 +835,7 @@ class OffloadingConnectorScheduler:
         complete_hit: int | None,
         full_attention_hit_boundary: int | None,
         max_num_new_tokens: int | None,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
         """Extend a complete-chunk hit with a partial tail, if supported."""
         req_status.partial_tail_boundary = None
@@ -845,7 +906,9 @@ class OffloadingConnectorScheduler:
                 if result is LookupResult.MISS:
                     max_boundary = bridge_boundary - tokens_per_hash
                     break
-                pending |= result is not LookupResult.HIT
+                if result is LookupResult.HIT and probe is not None:
+                    probe.ready_keys.add(key)
+                pending |= result is LookupResult.RETRY
         bridge_pending = pending
         # A tail of this request may lie below a sibling's longer full-attention
         # prefix. A block-aligned boundary there is a complete chunk, which the
@@ -855,7 +918,7 @@ class OffloadingConnectorScheduler:
                 continue
             loads_bridge = boundary >= bridge_boundary
             hit, boundary_pending = self._lookup_partial_tail(
-                req_status, boundary, loads_bridge and bridge_pending
+                req_status, boundary, loads_bridge and bridge_pending, probe
             )
             if hit:
                 # The complete-chunk lookup recorded the confirmed bridge keys.
@@ -877,14 +940,16 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         boundary: int,
         bridge_pending: bool,
+        probe: _LookupProbe | None = None,
     ) -> tuple[bool, bool]:
         """Look up every key a partial-tail hit at `boundary` loads.
 
         `bridge_pending` is True if a complete chunk that the hit also loads
         is not ready yet.
-        Returns `(hit, pending)`. `hit` is True only if every key is ready.
-        `pending` is True if no required key missed and a required key or
-        bridge chunk is not ready yet.
+        Returns `(hit, pending)`. `hit` is True if no required key missed; a
+        key that is present but not readable yet counts as a hit, and the
+        commit promotes it. `pending` is True if no required key missed and a
+        required key or bridge chunk is not ready yet.
         """
         req = req_status.req
         req_context = req_status.req_context
@@ -899,7 +964,12 @@ class OffloadingConnectorScheduler:
             result = self.manager.lookup(key, req_context)
             if result is LookupResult.MISS:
                 return False, False
-            pending |= result is not LookupResult.HIT
+            # HIT_PENDING is present and gets promoted by the commit; only an
+            # unconverged lookup or another request's in-flight load means
+            # "wait for more information".
+            if result is LookupResult.HIT and probe is not None:
+                probe.ready_keys.add(key)
+            pending |= result is LookupResult.RETRY
             boundary_keys.append((group_config, key))
 
         if pending:
@@ -993,7 +1063,19 @@ class OffloadingConnectorScheduler:
                 group_state.offload_keys.clear()
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+        plan_inputs = LoadPlanInputs(
+            local_prefix_tokens=num_computed_tokens,
+            max_load_tokens=req_status.max_load_tokens,
+            max_num_new_tokens=max_num_new_tokens,
+            group_tail_keys=tuple(
+                group_state.offload_keys[-1]
+                if group_state.offload_keys
+                else OffloadKey(b"")
+                for group_state in req_status.group_states
+            ),
+        )
 
+        lookup_start: float | None = None
         num_hit_tokens: int | None
         if (
             request.skip_reading_external_kv
@@ -1004,10 +1086,47 @@ class OffloadingConnectorScheduler:
             # A manager that cannot read is never queried, so it serves no
             # external hits; nor does an engine still waiting for its workers
             # (async_init).
+            if req_status.committed_plan is not None:
+                self.manager.commit_hits((), req_status.req_context)
+                req_status.clear_plan()
+            req_status.load_sources = {}
             num_hit_tokens = 0
+        elif req_status.committed_plan is not None:
+            lookup_start = time.monotonic()
+            if plan_inputs == req_status.committed_plan.inputs:
+                # The plan is committed. Re-check only its keys; do not re-run
+                # the walk. Pins are released while a request waits, so
+                # re-commit the readable set to take them again.
+                num_hit_tokens = self._poll_committed_plan(req_status)
+                if num_hit_tokens:
+                    sources = self.manager.commit_hits(
+                        req_status.committed_plan.keys, req_status.req_context
+                    )
+                    if sources is None:
+                        req_status.clear_plan()
+                        req_status.load_sources = {}
+                        req_status.partial_tail_boundary = None
+                        num_hit_tokens = 0
+                    else:
+                        req_status.load_sources = dict(sources)
+            else:
+                # An input moved -- the local prefix grew, the request was
+                # preempted and re-admitted, or a token cap changed -- so the
+                # plan is stale. Release it and plan again.
+                self.manager.commit_hits((), req_status.req_context)
+                req_status.clear_plan()
+                req_status.load_sources = {}
+                req_status.partial_tail_boundary = None
+                num_hit_tokens = self._lookup_and_commit(
+                    req_status, max_num_new_tokens, plan_inputs
+                )
         else:
             lookup_start = time.monotonic()
-            num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
+            num_hit_tokens = self._lookup_and_commit(
+                req_status, max_num_new_tokens, plan_inputs
+            )
+
+        if lookup_start is not None:
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1023,6 +1142,157 @@ class OffloadingConnectorScheduler:
             req_status, num_computed_tokens, num_hit_tokens
         )
         return num_hit_tokens, bool(num_hit_tokens) and not sync_load
+
+    def _lookup_and_commit(
+        self,
+        req_status: RequestOffloadState,
+        max_num_new_tokens: int | None,
+        plan_inputs: LoadPlanInputs,
+    ) -> int | None:
+        """Walk, then commit the keys the load will read.
+
+        Returns the hit count once readable, None while pending, and 0 if the
+        set cannot be committed.
+        """
+        probe = _LookupProbe()
+        num_hit_tokens = self._lookup(req_status, max_num_new_tokens, probe)
+        if num_hit_tokens is None:
+            return None
+        if num_hit_tokens == 0:
+            # No hit to commit; prefill or re-look later.
+            return 0
+
+        num_cached_tokens = req_status.num_locally_computed_tokens + num_hit_tokens
+        keys = self._keys_to_load(req_status, num_cached_tokens)
+        if not keys:
+            # Nothing to read from offloaded memory; prefill instead.
+            return 0
+
+        # Keys the walk did not see readable: check them before committing, so
+        # an unconverged lookup defers the request instead of refusing the
+        # whole set. The lookup below starts the tier's async resolution.
+        unverified: dict[OffloadKey, LookupResult] = {}
+        for key in keys:
+            if key in probe.ready_keys:
+                continue
+            result = self.manager.lookup(key, req_status.req_context)
+            if result is LookupResult.RETRY:
+                return None
+            unverified[key] = result
+
+        sources = self.manager.commit_hits(keys, req_status.req_context)
+        if sources is None:
+            logger.debug(
+                "Offloading manager refused to commit %d keys for %s; "
+                "recomputing instead of waiting",
+                len(keys),
+                req_status.req.request_id,
+            )
+            req_status.partial_tail_boundary = None
+            req_status.load_sources = {}
+            return 0
+
+        req_status.load_sources = dict(sources)
+        req_status.committed_plan = CommittedLoadPlan(
+            keys=tuple(keys),
+            num_hit_tokens=num_hit_tokens,
+            partial_tail_boundary=req_status.partial_tail_boundary,
+            inputs=plan_inputs,
+        )
+        unreadable = [
+            key for key, result in unverified.items() if result is not LookupResult.HIT
+        ]
+        if unreadable:
+            # A committed key the walk did not see readable (pending, or a
+            # chunk the load window added); the next poll re-checks it.
+            logger.debug(
+                "Offloading manager committed %d keys for %s with %d unreadable; "
+                "deferring until the committed set is readable",
+                len(keys),
+                req_status.req.request_id,
+                len(unreadable),
+            )
+            return None
+        return num_hit_tokens
+
+    def _poll_committed_plan(self, req_status: RequestOffloadState) -> int | None:
+        """Re-check a committed plan without re-walking it.
+
+        Returns the planned hit count when readable, None while pending, and
+        0 when a committed key is gone (the plan is then released).
+        """
+        plan = req_status.committed_plan
+        assert plan is not None
+        pending = False
+        for key in plan.keys:
+            result = self.manager.lookup(key, req_status.req_context)
+            if result is LookupResult.HIT:
+                continue
+            if result is LookupResult.MISS:
+                # The key was evicted while the plan waited. Re-commit repairs
+                # it from a secondary copy, or returns None to prefill.
+                sources = self.manager.commit_hits(plan.keys, req_status.req_context)
+                if sources is None:
+                    logger.debug(
+                        "Committed key for %s is gone; releasing the load plan",
+                        req_status.req.request_id,
+                    )
+                    req_status.clear_plan()
+                    req_status.load_sources = {}
+                    req_status.partial_tail_boundary = None
+                    return 0
+                req_status.load_sources = dict(sources)
+                return None
+            pending = True
+        if pending:
+            return None
+        if self._chunks_being_loaded and not set(plan.keys).isdisjoint(
+            self._chunks_being_loaded
+        ):
+            # Another request is already loading one of these chunks; wait
+            # instead of issuing a duplicate transfer.
+            return None
+        req_status.partial_tail_boundary = plan.partial_tail_boundary
+        return plan.num_hit_tokens
+
+    def _keys_to_load(
+        self, req_status: RequestOffloadState, num_cached_tokens: int
+    ) -> list[OffloadKey]:
+        """Return the offload keys a load to `num_cached_tokens` reads.
+
+        The commit happens before device blocks are allocated, so the set it
+        covers can only be a superset of what the load reads:
+        `update_state_after_alloc` rebuilds this set from the allocated blocks
+        and asserts the commit covered it.
+        """
+        partial_tail_boundary = req_status.partial_tail_boundary
+        local_tokens = req_status.num_locally_computed_tokens
+        keys: list[OffloadKey] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
+            end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
+            start_chunk_idx = local_tokens // tokens_per_chunk
+            # Sparse groups load only their window; a partial tail is
+            # appended below.
+            window = group_config.load_window_size_in_chunks(num_cached_tokens)
+            if window is not None:
+                start_chunk_idx = max(start_chunk_idx, num_chunks - window)
+            offload_keys = group_state.offload_keys
+            assert len(offload_keys) >= end_chunk_idx, (
+                f"request {req_status.req.request_id} has "
+                f"{len(offload_keys)} offload keys, needs {end_chunk_idx}"
+            )
+            keys.extend(offload_keys[start_chunk_idx:end_chunk_idx])
+            if partial_tail_boundary is not None:
+                keys.append(
+                    req_status.register_boundary_key(
+                        group_config.group_idx, partial_tail_boundary
+                    )
+                )
+        return keys
 
     def _reserve_sync_load(
         self,
@@ -1068,6 +1338,7 @@ class OffloadingConnectorScheduler:
         start = req_status.num_locally_computed_tokens
         end = start + num_external_tokens
 
+        load_sources: Mapping[OffloadKey, CacheHitSource] = req_status.load_sources
         events: list[tuple[int, int, CacheHitSource]] = [
             (end, 0, CacheHitSource.EXTERNAL_UNSPECIFIED)
         ]
@@ -1076,7 +1347,7 @@ class OffloadingConnectorScheduler:
             if lo >= hi:
                 continue
             source = CacheHitSource(
-                self.manager.get_load_source(key, req_status.req_context)
+                load_sources.get(key, CacheHitSource.EXTERNAL_UNSPECIFIED)
             )
             events.extend(((lo, 1, source), (hi, -1, source)))
 
@@ -1126,6 +1397,14 @@ class OffloadingConnectorScheduler:
             )
 
         if num_external_tokens == 0:
+            # Core dropped the external hit after the connector committed it
+            # (e.g. the local partial tail won). Release the plan's pins.
+            if req_status.committed_plan is not None:
+                self._acquire_step()
+                self.manager.commit_hits((), req_status.req_context)
+                req_status.clear_plan()
+                req_status.load_sources = {}
+            req_status.partial_tail_boundary = None
             return
 
         # prepare_load() below pins keys that get_num_new_matched_tokens()
@@ -1221,6 +1500,25 @@ class OffloadingConnectorScheduler:
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(load_start_gpu_block_idx)
+
+        committed_plan = req_status.committed_plan
+        if committed_plan is not None:
+            loaded = list(dict.fromkeys(keys_to_load))
+            committed = set(committed_plan.keys)
+            # Core may shorten the accepted hit after the connector lookup
+            # (prefix replay, partial-tail reconciliation), but it must never
+            # read a key the commit did not cover.
+            assert set(loaded) <= committed, (
+                "prepare_load reads keys the commit did not cover for "
+                f"request {request.request_id}"
+            )
+            if len(loaded) != len(committed):
+                # Release the committed keys this load will not read. A refused
+                # shrink loses provenance but the load still covers committed
+                # keys, so it proceeds.
+                sources = self.manager.commit_hits(loaded, req_status.req_context)
+                req_status.load_sources = {} if sources is None else dict(sources)
+            req_status.clear_plan()
 
         for handler in self._store_handlers.values():
             handler.on_load_scheduled(req_status, num_cached_tokens)
@@ -1378,6 +1676,22 @@ class OffloadingConnectorScheduler:
                     self._current_batch_jobs_to_flush.add(job_id)
         return job_id
 
+    def _live_plan_req_ids(self, scheduler_output: SchedulerOutput) -> set[str]:
+        """Requests whose committed plan must keep its pins this step.
+
+        A scheduled request reads its plan now. A request whose async load the
+        core accepted but deferred `update_state_after_alloc` still waits on
+        that callback, so its plan must survive until the deferred drain.
+        """
+        live = set(scheduler_output.num_scheduled_tokens)
+        live.update(
+            req_id
+            for req_id, req_status in self._req_status.items()
+            if req_status.committed_plan is not None
+            and req_status.req.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+        )
+        return live
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1409,6 +1723,7 @@ class OffloadingConnectorScheduler:
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
+            scheduled_req_ids=self._live_plan_req_ids(scheduler_output),
         )
 
         # Flush jobs for preempted requests.
@@ -1686,6 +2001,10 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
+        # The request will not load its committed plan; the manager releases
+        # the pins at on_request_finished.
+        req_status.clear_plan()
+        req_status.load_sources.clear()
 
         # Update offload keys with final block hash so the store handlers can
         # create store jobs for the last block(s) on the next schedule step.
@@ -1750,6 +2069,8 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
+            status.clear_plan()
+            status.load_sources.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

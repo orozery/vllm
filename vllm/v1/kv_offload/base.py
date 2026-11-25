@@ -192,6 +192,9 @@ class ScheduleEndContext(NamedTuple):
     new_req_ids: Collection[str]
     # Request IDs preempted this step.
     preempted_req_ids: Collection[str]
+    # Requests scheduled this step. A plan whose request is absent releases
+    # its pins. None means unknown, so pins are not expired.
+    scheduled_req_ids: Collection[str] | None = None
 
 
 class LoadStoreSpec:
@@ -248,8 +251,13 @@ This class runs in the scheduler, tracks which blocks are offloaded
 and their address.
 
 The class provides the following primitives:
-    lookup() - check whether a single block is offloaded and ready.
-    prepare_load() - prepare given blocks to be read.
+    lookup() - report whether a single block is offloaded and readable.
+        Non-binding: nothing is reserved or transferred by the call.
+    commit_hits() - commit to reading the looked-up block set.
+        Allocates and pins what the load needs across the whole set at once,
+        and reports each block's provenance. Returns no LoadSpec: a promoted
+        block becomes readable only after commit_hits returns.
+    prepare_load() - prepare committed blocks to be read.
         The given blocks will be protected from eviction.
         This function returns a LoadSpec which encapsulates
         information required for performing the load.
@@ -340,6 +348,9 @@ class ConfigInfo:
 
 
 class OffloadingManager(ABC):
+    # Provenance reported for keys the manager's own storage serves.
+    primary_hit_source: ClassVar[CacheHitSource] = CacheHitSource.EXTERNAL_UNSPECIFIED
+
     @property
     def lock(self) -> AbstractContextManager[Any]:
         """Context manager granting exclusive access to this manager's state.
@@ -362,31 +373,65 @@ class OffloadingManager(ABC):
 
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        """Checks whether a single block is offloaded and ready to be read.
+        """Report whether a single block is offloaded and readable, without
+        committing to it.
+
+        A lookup reserves nothing and starts no transfer. The connector may
+        look up more blocks than it later reads, and commits the set it reads
+        with one `commit_hits` call.
 
         Args:
             key: the key identifying the block to lookup.
             req_context: per-request context (e.g. kv_transfer_params).
 
         Returns:
-            HIT if the block is offloaded and ready, MISS if not found,
-            HIT_PENDING if found but not yet readable, or RETRY if the
-            lookup should be retried later.
+            HIT if the block is readable now.
+            HIT_PENDING if it is present but not readable yet; look it up
+                again later.
+            MISS if it is not present in any allowed tier.
+            RETRY if a tier's state has not converged; look it up again.
 
         """
         pass
 
-    def get_load_source(
-        self, key: OffloadKey, req_context: ReqContext
-    ) -> CacheHitSource:
-        """Return the cache tier that supplied a successful lookup.
+    def commit_hits(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> Mapping[OffloadKey, CacheHitSource] | None:
+        """Claim `keys` for reading after a converged `lookup`.
 
-        This is queried only after `lookup` resolves to `HIT`. Composing
-        managers can override it to retain the origin across asynchronous
-        promotion into a primary tier. The default keeps out-of-tree managers
-        compatible while making unknown provenance explicit.
+        The caller looks keys up first, then claims the set it will read. A
+        manager that must allocate does so here; pins last until
+        `prepare_load`/`complete_load` or request finish. The default needs no
+        reservation.
+
+        Timing: this runs while the request is being considered for
+        scheduling, after `on_new_request` and before its device blocks are
+        allocated. It reserves the offloaded side only; an unscheduled
+        request's pins are released at the end of the step, and its plan at
+        finish or cache reset. An empty `keys` releases the plan, so it must
+        be handled as a release, not a no-op. A repeat call re-pins recorded
+        keys that are readable now.
+
+        The default reserves nothing, so a key that is present is committable
+        even while it is still becoming readable (HIT_PENDING); it refuses the
+        set only when a key is missing. It keeps out-of-tree managers
+        compatible.
+
+        Args:
+            keys: Every key the load will read.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            A mapping from each key to the tier it came from, or None if the
+            set cannot be committed. None means the caller prefills; a
+            committed set is never empty, so an empty `keys` returns None.
+
         """
-        return CacheHitSource.EXTERNAL_UNSPECIFIED
+        if not keys or any(
+            self.lookup(key, req_context) is LookupResult.MISS for key in keys
+        ):
+            return None
+        return dict.fromkeys(keys, self.primary_hit_source)
 
     @abstractmethod
     def prepare_load(
@@ -398,6 +443,11 @@ class OffloadingManager(ABC):
         The given blocks will be protected from eviction until
         complete_load is called.
         It assumes all given blocks are offloaded.
+
+        Called after the scheduler allocates the request's device blocks, so
+        it is the first sign that a committed set will actually be read. It
+        transfers the claim pins to the load; if it never arrives, the
+        claim is released at request finish or cache reset.
 
         Args:
             keys: the keys identifying the blocks.
@@ -512,6 +562,10 @@ class OffloadingManager(ABC):
 
         Managers may override this to flush deferred work accumulated
         during the step (e.g., batched promotions).
+
+        `ScheduleEndContext.scheduled_req_ids` names the requests whose
+        committed plan is still live, so a manager that pins committed keys can
+        release the rest.
 
         A tier manager reports only events for storage state it owns. A
         composing manager may aggregate child event streams, but should not
