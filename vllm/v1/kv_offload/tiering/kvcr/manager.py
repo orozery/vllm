@@ -192,18 +192,19 @@ class _FrameworkPinAdapter:
         try:
             parent.on_new_request(req_context)
             started = True
-            hit_keys = tuple(
-                key
-                for key in offload_keys
-                if parent.lookup(key, req_context) is LookupResult.HIT
-            )
-            if not hit_keys:
+            # KVCR can only use a chunk that is already readable, so it never
+            # promotes; the claim reports secondary-only keys as missing.
+            claim = parent.claim_hits(offload_keys, req_context, promote=False)
+            job = claim.job
+            if job is None:
                 return None
 
-            job = parent.create_store_job(hit_keys, req_context)
             job_keys = tuple(job.keys)
-            if len(job_keys) != len(job.chunk_ids) or (
-                job_keys is not hit_keys and set(job_keys) != set(hit_keys)
+            job_key_set = set(job_keys)
+            if (
+                len(job_keys) != len(job.chunk_ids)
+                or not job_key_set.issubset(offload_keys)
+                or job_key_set & set(claim.pending_keys)
             ):
                 return None
 

@@ -28,7 +28,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
 )
-from vllm.v1.kv_offload.tiering.base import TransferJob
+from vllm.v1.kv_offload.tiering.base import ClaimResult, TransferJob
 from vllm.v1.kv_offload.tiering.p2p.session import (
     LoadResult,
     P2PSession,
@@ -283,10 +283,13 @@ class FakeParent:
         stored: dict[OffloadKey, int] | None = None,
         pending: set[OffloadKey] | None = None,
         retry: set[OffloadKey] | None = None,
+        rejected: set[OffloadKey] | None = None,
     ) -> None:
         self.stored: dict[OffloadKey, int] = dict(stored or {})
         self.pending: set[OffloadKey] = set(pending or ())
         self.retry: set[OffloadKey] = set(retry or ())
+        # Keys the primary refuses to take when claimed.
+        self.rejected: set[OffloadKey] = set(rejected or ())
         self._next_job_id: int = 1000
         self.calls: list[tuple] = []
 
@@ -304,23 +307,36 @@ class FakeParent:
             return LookupResult.HIT
         return LookupResult.MISS
 
-    def create_store_job(
+    def claim_hits(
         self,
         keys: Sequence[OffloadKey],
         ctx: ReqContext,
-    ) -> TransferJob:
+        *,
+        promote: bool = True,
+    ) -> ClaimResult:
         keys_list = list(keys)
-        self.calls.append(("create_store_job", tuple(keys_list), ctx.req_id))
-        chunk_ids = np.array([self.stored[k] for k in keys_list], dtype=np.int32)
-        job_id = self._next_job_id
-        self._next_job_id += 1
-        return TransferJob(
-            job_id=job_id,
-            keys=keys_list,
-            chunk_ids=chunk_ids,
-            is_promotion=False,
-            req_context=ctx,
-        )
+        self.calls.append(("claim_hits", tuple(keys_list), ctx.req_id))
+        claimed = [k for k in keys_list if k in self.stored]
+        rejected = [k for k in keys_list if k in self.rejected]
+        pending = [k for k in keys_list if k in self.pending and k not in self.rejected]
+        missing = [
+            k
+            for k in keys_list
+            if k not in self.stored and k not in self.pending and k not in self.rejected
+        ]
+        job = None
+        if claimed:
+            chunk_ids = np.array([self.stored[k] for k in claimed], dtype=np.int32)
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            job = TransferJob(
+                job_id=job_id,
+                keys=claimed,
+                chunk_ids=chunk_ids,
+                is_promotion=False,
+                req_context=ctx,
+            )
+        return ClaimResult(job, pending, missing, rejected)
 
     def on_request_finished(self, ctx: ReqContext) -> None:
         self.calls.append(("on_request_finished", ctx.req_id))
@@ -1536,7 +1552,7 @@ def _lookup_resps(conn: FakeConnection, since: int = 0) -> list[dict]:
 
 class TestServerLookupHandling:
     def test_immediate_hits_create_one_store_job(self):
-        """All-HIT batch: one create_store_job call with all keys, one
+        """All-HIT batch: one claim_hits call with all keys, one
         LookupRespMsg with hits=[True]*N, on_request_finished fires at the
         end of serve, and `available` is populated for the eventual fetch."""
         cb = FakeParent(
@@ -1556,8 +1572,8 @@ class TestServerLookupHandling:
         assert resps[0][LookupRespMsg.HITS] == [True, True, True]
 
         kinds = [c[0] for c in cb.calls]
-        assert kinds.count("create_store_job") == 1
-        cs = next(c for c in cb.calls if c[0] == "create_store_job")
+        assert kinds.count("claim_hits") == 1
+        cs = next(c for c in cb.calls if c[0] == "claim_hits")
         assert cs[1] == (b"hA", b"hB", b"hC")
         assert cb.calls[-1][0] == "on_request_finished"
 
@@ -1569,7 +1585,7 @@ class TestServerLookupHandling:
         }
 
     def test_all_misses_no_store_job_finish_fires(self):
-        """All-MISS batch: no create_store_job call; one LookupRespMsg
+        """All-MISS batch: no claim_hits call; one LookupRespMsg
         with hits=[False]*N; on_request_finished fires at end of serve."""
         cb = FakeParent()
         session, conn, _ = _make_session()
@@ -1583,7 +1599,7 @@ class TestServerLookupHandling:
         resps = _lookup_resps(conn, sent_before)
         assert len(resps) == 1
         assert resps[0][LookupRespMsg.HITS] == [False, False]
-        assert all(c[0] != "create_store_job" for c in cb.calls)
+        assert all(c[0] != "claim_hits" for c in cb.calls)
         assert cb.calls[-1][0] == "on_request_finished"
 
     def test_mixed_hit_miss_pending_defers_response_until_aggregate(self):
@@ -1606,10 +1622,11 @@ class TestServerLookupHandling:
 
         # No LookupRespMsg yet — hB and hD are still pending.
         assert _lookup_resps(conn, sent_before) == []
-        # HIT is still pinned immediately so the eventual FetchMsg matches.
-        cs_calls = [c for c in cb.calls if c[0] == "create_store_job"]
+        # HIT is pinned immediately and the pending key is claimed so its
+        # promotion starts; the claim reports only hA in the job.
+        cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
         assert len(cs_calls) == 1
-        assert cs_calls[0][1] == (b"hA",)
+        assert cs_calls[0][1] == (b"hA", b"hB")
         # Lookup is parked; on_request_finished not yet called.
         assert all(c[0] != "on_request_finished" for c in cb.calls)
         assert len(_srv_lookups(session)) == 1
@@ -1617,7 +1634,7 @@ class TestServerLookupHandling:
     def test_pending_resolves_then_aggregate_response_fires(self):
         """A HIT_PENDING key that becomes HIT on a later poll releases
         the deferred aggregate response: one LookupRespMsg carrying
-        both keys in wire order, and one create_store_job call per
+        both keys in wire order, and one claim_hits call per
         HIT (the second HIT is pinned when it resolves, not when the
         response goes out)."""
         cb = FakeParent(stored={OffloadKey(b"hA"): 1}, pending={OffloadKey(b"hB")})
@@ -1643,14 +1660,55 @@ class TestServerLookupHandling:
         assert resps[0][LookupRespMsg.KEYS] == [b"hA", b"hB"]
         assert resps[0][LookupRespMsg.HITS] == [True, True]
 
-        cs_calls = [c for c in cb.calls if c[0] == "create_store_job"]
+        cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
         assert len(cs_calls) == 2
-        assert cs_calls[0][1] == (b"hA",)
+        # The first claim covers hA and the then-pending hB; the second
+        # claims hB once it is readable.
+        assert cs_calls[0][1] == (b"hA", b"hB")
         assert cs_calls[1][1] == (b"hB",)
         # on_request_finished fires once after the aggregate resolve.
         assert sum(1 for c in cb.calls if c[0] == "on_request_finished") == 1
         assert b"hA" in _srv_outbound(session, "req-1").available
         assert b"hB" in _srv_outbound(session, "req-1").available
+
+    def test_hit_evicted_before_the_claim_is_not_answered(self):
+        """A key that looked up HIT but that the claim reports pending (it was
+        evicted in between) is not answered HIT with nothing pinned."""
+        key = OffloadKey(b"hA")
+
+        class EvictedAfterLookup(FakeParent):
+            def lookup(self, key: OffloadKey, ctx: ReqContext) -> LookupResult:
+                return LookupResult.HIT
+
+        cb = EvictedAfterLookup(pending={key})
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        sent_before = len(conn._sent)
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+        _serve(session, cb)
+
+        assert _lookup_resps(conn, sent_before) == []
+
+    def test_rejected_claim_resolves_miss_immediately(self):
+        """A key the producer's primary cannot take resolves MISS at once,
+        instead of parking the consumer until the lookup deadline."""
+        key = OffloadKey(b"hA")
+        cb = FakeParent(pending={key}, rejected={key})
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        sent_before = len(conn._sent)
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+        _serve(session, cb)
+        _serve(session, cb)
+
+        resps = _lookup_resps(conn, sent_before)
+        assert len(resps) == 1
+        assert resps[0][LookupRespMsg.KEYS] == [b"hA"]
+        assert resps[0][LookupRespMsg.HITS] == [False]
 
     def test_pending_timeout_replies_miss_no_store_job(self):
         """A HIT_PENDING key that stays pending past the batch
@@ -1677,8 +1735,32 @@ class TestServerLookupHandling:
         assert len(resps) == 1
         assert resps[0][LookupRespMsg.KEYS] == [b"hA"]
         assert resps[0][LookupRespMsg.HITS] == [False]
-        assert all(c[0] != "create_store_job" for c in cb.calls)
+        # The pending key is claimed on each poll (idempotent while a
+        # promotion is in flight), then the timeout reports MISS.
+        cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
+        assert [c[1] for c in cs_calls] == [(b"hA",), (b"hA",)]
         assert sum(1 for c in cb.calls if c[0] == "on_request_finished") == 1
+
+    def test_retry_then_pending_claims_the_key(self):
+        """A key that starts as RETRY and converges to a secondary copy is
+        claimed even though it was already parked as pending."""
+        key = OffloadKey(b"hA")
+        cb = FakeParent(retry={key})
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+        _serve(session, cb)
+        assert all(c[0] != "claim_hits" for c in cb.calls)
+
+        # The probe converges: the copy is present, not readable.
+        cb.retry.discard(key)
+        cb.pending.add(key)
+        _serve(session, cb)
+
+        cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
+        assert [c[1] for c in cs_calls] == [(b"hA",)]
 
     def test_finish_request_called_per_lookup_msg_not_per_kv_request_id(self):
         """Two LookupMsgs for the same kv_request_id get distinct ctxs
@@ -1800,7 +1882,7 @@ class TestServerLookupHandling:
     def test_lookup_then_fetch_round_trip_emits_store_result(self):
         """End-to-end: lookup pins primary slots → fetch matches them →
         NIXL transfer completes → StoreResult surfaces with the
-        create_store_job's job_id (the engine releases the pin)."""
+        claim_hits's job_id (the engine releases the pin)."""
         cb = FakeParent(stored={OffloadKey(b"hA"): 7, OffloadKey(b"hB"): 8})
         session, conn, transport = _make_session()
         _activate(session, conn)
@@ -1808,7 +1890,7 @@ class TestServerLookupHandling:
         _send_lookup(conn, "req-1", [b"hA", b"hB"])
         session.poll()
         _serve(session, cb)
-        cs = next(c for c in cb.calls if c[0] == "create_store_job")
+        cs = next(c for c in cb.calls if c[0] == "claim_hits")
         # FakeParent issues monotonic job_ids starting at 1000.
         expected_job_id = 1000
 
