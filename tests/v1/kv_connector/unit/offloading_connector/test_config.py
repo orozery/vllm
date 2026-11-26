@@ -560,6 +560,55 @@ def test_hisparse_offloads_only_indexer_group():
     assert [group.group_idx for group in scheduler_config.kv_group_configs] == [1]
 
 
+def _bounded_replay_swa_group() -> KVCacheGroup:
+    return make_kv_cache_group(
+        ["replay"],
+        _full_attention_spec(block_size=32),
+        SlidingWindowManager,
+        SlidingWindowManager.config(sliding_window=64, bounded_replay=True),
+    )
+
+
+@pytest.mark.parametrize(
+    ("hisparse", "offload_sliding_window", "allowed"),
+    [(False, False, True), (False, True, False), (True, False, True)],
+)
+def test_prefix_replay_offloads_only_full_attention_groups(
+    hisparse, offload_sliding_window, allowed
+):
+    """Core trims a hit under bounded replay; only full-attention groups still
+    load a subset of the committed keys, whichever groups are offloaded."""
+    if hisparse:
+        groups = [
+            make_kv_cache_group(
+                ["source"], _full_attention_spec(64), host_resident=True
+            ),
+            make_kv_cache_group(
+                ["indexer"],
+                _full_attention_spec(64),
+                role=KVCacheGroupRole.HISPARSE_INDEXER,
+            ),
+        ]
+    else:
+        groups = [make_kv_cache_group(["full"], _full_attention_spec(64))]
+    if offload_sliding_window:
+        groups.append(_swa_group(["swa"], _full_attention_spec(32), 64))
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[*groups, _bounded_replay_swa_group()],
+        hisparse_host_num_blocks=4 if hisparse else None,
+    )
+    config = _make_vllm_config()
+    spec = MockOffloadingSpec(build_offloading_config(config, kv_cache_config))
+
+    if allowed:
+        SchedulerOffloadConfig.from_spec(spec, config, kv_cache_config)
+    else:
+        with pytest.raises(ValueError, match="only full-attention groups"):
+            SchedulerOffloadConfig.from_spec(spec, config, kv_cache_config)
+
+
 def test_hisparse_indexer_tier_is_single_copy_under_tp():
     """The resident groups' raw pages carry no TP metadata; they must not
     force a copy of the replicated indexer per rank."""

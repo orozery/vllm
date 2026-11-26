@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections import Counter
-from collections.abc import Collection, Generator, Iterable, Sequence
+from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
@@ -27,7 +27,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _TransferMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.state import (
+    CommittedLoadPlan,
     GroupOffloadConfig,
+    LoadPlanInputs,
     RequestGroupState,
     RequestOffloadState,
     SchedulerOffloadConfig,
@@ -1070,9 +1072,21 @@ class OffloadingConnectorScheduler:
                 group_state.offload_keys.clear()
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+        # A committed plan is reused only while these inputs stay unchanged.
+        plan_inputs = LoadPlanInputs(
+            local_prefix_tokens=num_computed_tokens,
+            max_load_tokens=req_status.max_load_tokens,
+            max_num_new_tokens=max_num_new_tokens,
+            group_tail_keys=tuple(
+                group_state.offload_keys[-1]
+                if group_state.offload_keys
+                else OffloadKey(b"")
+                for group_state in req_status.group_states
+            ),
+        )
 
+        lookup_start: float | None = None
         num_hit_tokens: int | None
-        probe = _LookupProbe()
         if (
             request.skip_reading_external_kv
             or req_status.load_failed
@@ -1082,14 +1096,52 @@ class OffloadingConnectorScheduler:
             # A manager that cannot read is never queried, so it serves no
             # external hits; nor does an engine still waiting for its workers
             # (async_init).
+            if req_status.committed_plan is not None:
+                self.manager.commit_hits((), req_status.req_context)
+                req_status.clear_plan()
             req_status.load_sources = {}
             num_hit_tokens = 0
+        elif req_status.committed_plan is not None:
+            lookup_start = time.monotonic()
+            if plan_inputs == req_status.committed_plan.inputs:
+                # The plan is committed. Re-check only its keys; do not re-run
+                # the walk. Pins are released while a request waits, so
+                # re-commit the readable set to take them again.
+                num_hit_tokens = self._poll_committed_plan(req_status)
+                if num_hit_tokens:
+                    sources = self.manager.commit_hits(
+                        req_status.committed_plan.keys, req_status.req_context
+                    )
+                    if sources is None:
+                        req_status.clear_plan()
+                        req_status.load_sources = {}
+                        req_status.partial_tail_boundary = None
+                        num_hit_tokens = 0
+                    else:
+                        req_status.load_sources = dict(sources)
+                if num_hit_tokens == 0:
+                    # A committed key is gone; plan again from what is left.
+                    num_hit_tokens = self._lookup_and_commit(
+                        req_status, max_num_new_tokens, plan_inputs
+                    )
+            else:
+                # An input moved -- the local prefix grew, the request was
+                # preempted and re-admitted, or a token cap changed -- so the
+                # plan is stale. Release it and plan again.
+                self.manager.commit_hits((), req_status.req_context)
+                req_status.clear_plan()
+                req_status.load_sources = {}
+                req_status.partial_tail_boundary = None
+                num_hit_tokens = self._lookup_and_commit(
+                    req_status, max_num_new_tokens, plan_inputs
+                )
         else:
             lookup_start = time.monotonic()
-            num_hit_tokens = self._lookup(req_status, max_num_new_tokens, probe)
-            if num_hit_tokens:
-                # The commit's wait is part of the lookup's async delay.
-                num_hit_tokens = self._commit_load(req_status, num_hit_tokens, probe)
+            num_hit_tokens = self._lookup_and_commit(
+                req_status, max_num_new_tokens, plan_inputs
+            )
+
+        if lookup_start is not None:
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1106,17 +1158,25 @@ class OffloadingConnectorScheduler:
         )
         return num_hit_tokens, bool(num_hit_tokens) and not sync_load
 
-    def _commit_load(
+    def _lookup_and_commit(
         self,
         req_status: RequestOffloadState,
-        num_hit_tokens: int,
-        probe: _LookupProbe,
+        max_num_new_tokens: int | None,
+        plan_inputs: LoadPlanInputs,
     ) -> int | None:
-        """Commit the keys the load will read.
+        """Walk, then commit the keys the load will read.
 
-        Returns the hit count once the committed set is readable, None while
-        pending, and 0 if the set cannot be committed.
+        Returns the hit count once readable, None while pending, and 0 if the
+        set cannot be committed.
         """
+        probe = _LookupProbe()
+        num_hit_tokens = self._lookup(req_status, max_num_new_tokens, probe)
+        if num_hit_tokens is None:
+            return None
+        if num_hit_tokens == 0:
+            # No hit to commit; prefill or re-look later.
+            return 0
+
         num_cached_tokens = req_status.num_locally_computed_tokens + num_hit_tokens
         keys = self._keys_to_commit(req_status, num_cached_tokens)
         if not keys:
@@ -1124,8 +1184,8 @@ class OffloadingConnectorScheduler:
             return 0
 
         # Keys the walk did not see readable: check them before committing, so
-        # an unconverged lookup defers instead of refusing the whole set. The
-        # lookup also starts the tier's async resolution.
+        # an unconverged lookup defers the request instead of refusing the
+        # whole set. The lookup below starts the tier's async resolution.
         unverified: dict[OffloadKey, LookupResult] = {}
         for key in keys:
             if key in probe.ready_keys:
@@ -1149,10 +1209,18 @@ class OffloadingConnectorScheduler:
             return 0
 
         req_status.load_sources = dict(sources)
+        req_status.committed_plan = CommittedLoadPlan(
+            keys=tuple(keys),
+            num_hit_tokens=num_hit_tokens,
+            partial_tail_boundary=req_status.partial_tail_boundary,
+            inputs=plan_inputs,
+        )
         unreadable = [
             key for key, result in unverified.items() if result is not LookupResult.HIT
         ]
         if unreadable:
+            # A committed key the walk did not see readable (pending, or a
+            # chunk the load window added); the next poll re-checks it.
             logger.debug(
                 "Offloading manager committed %d keys for %s with %d unreadable; "
                 "deferring until the committed set is readable",
@@ -1163,10 +1231,56 @@ class OffloadingConnectorScheduler:
             return None
         return num_hit_tokens
 
+    def _poll_committed_plan(self, req_status: RequestOffloadState) -> int | None:
+        """Re-check a committed plan without re-walking it.
+
+        Returns the planned hit count when readable, None while pending, and
+        0 when a committed key is gone (the plan is then released).
+        """
+        plan = req_status.committed_plan
+        assert plan is not None
+        pending = False
+        for key in plan.keys:
+            result = self.manager.lookup(key, req_status.req_context)
+            if result is LookupResult.HIT:
+                continue
+            if result is LookupResult.MISS:
+                # The key was evicted while the plan waited. Re-commit repairs
+                # it from a secondary copy, or returns None to prefill.
+                sources = self.manager.commit_hits(plan.keys, req_status.req_context)
+                if sources is None:
+                    logger.debug(
+                        "Committed key for %s is gone; releasing the load plan",
+                        req_status.req.request_id,
+                    )
+                    req_status.clear_plan()
+                    req_status.load_sources = {}
+                    req_status.partial_tail_boundary = None
+                    return 0
+                req_status.load_sources = dict(sources)
+                return None
+            pending = True
+        if pending:
+            return None
+        if self._chunks_being_loaded and not set(plan.keys).isdisjoint(
+            self._chunks_being_loaded
+        ):
+            # Another request is already loading one of these chunks; wait
+            # instead of issuing a duplicate transfer.
+            return None
+        req_status.partial_tail_boundary = plan.partial_tail_boundary
+        return plan.num_hit_tokens
+
     def _keys_to_commit(
         self, req_status: RequestOffloadState, num_cached_tokens: int
     ) -> list[OffloadKey]:
-        """Return the offload keys a load to `num_cached_tokens` reads."""
+        """Return the offload keys a load to `num_cached_tokens` reads.
+
+        The commit happens before device blocks are allocated, so the set it
+        covers can only be a superset of what the load reads:
+        `update_state_after_alloc` rebuilds this set from the allocated blocks
+        and asserts the commit covered it.
+        """
         partial_tail_boundary = req_status.partial_tail_boundary
         local_tokens = req_status.num_locally_computed_tokens
         keys: list[OffloadKey] = []
@@ -1240,10 +1354,10 @@ class OffloadingConnectorScheduler:
         start = req_status.num_locally_computed_tokens
         end = start + num_external_tokens
 
+        load_sources: Mapping[OffloadKey, CacheHitSource] = req_status.load_sources
         events: list[tuple[int, int, CacheHitSource]] = [
             (end, 0, CacheHitSource.EXTERNAL_UNSPECIFIED)
         ]
-        load_sources = req_status.load_sources
         for lo, hi, key in req_status.load_key_ranges:
             lo, hi = max(start, lo), min(end, hi)
             if lo >= hi:
@@ -1300,11 +1414,12 @@ class OffloadingConnectorScheduler:
 
         if num_external_tokens == 0:
             # Core dropped the external hit after the connector committed it
-            # (e.g. the local partial tail won). Release whatever the commit
-            # took; a no-op for a request with nothing committed.
-            self._acquire_step()
-            self.manager.commit_hits((), req_status.req_context)
-            req_status.load_sources = {}
+            # (e.g. the local partial tail won). Release the plan's pins.
+            if req_status.committed_plan is not None:
+                self._acquire_step()
+                self.manager.commit_hits((), req_status.req_context)
+                req_status.clear_plan()
+                req_status.load_sources = {}
             req_status.partial_tail_boundary = None
             return
 
@@ -1401,6 +1516,26 @@ class OffloadingConnectorScheduler:
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(load_start_gpu_block_idx)
+
+        # Reconcile the allocated load with the commit, then consume the plan.
+        committed_plan = req_status.committed_plan
+        if committed_plan is not None:
+            load_keys = list(dict.fromkeys(keys_to_load))
+            committed_keys = set(committed_plan.keys)
+            # Core may shorten the accepted hit after the connector lookup
+            # (prefix replay, partial-tail reconciliation), but it must never
+            # read a key the commit did not cover.
+            assert set(load_keys) <= committed_keys, (
+                "prepare_load reads keys the commit did not cover for "
+                f"request {request.request_id}"
+            )
+            if len(load_keys) != len(committed_keys):
+                # Release the committed keys this load will not read. A refusal
+                # drops the plan, but nothing evicts these keys before
+                # prepare_load below pins them, so only provenance is lost.
+                sources = self.manager.commit_hits(load_keys, req_status.req_context)
+                req_status.load_sources = {} if sources is None else dict(sources)
+            req_status.clear_plan()
 
         for handler in self._store_handlers.values():
             handler.on_load_scheduled(req_status, num_cached_tokens)
@@ -1569,7 +1704,7 @@ class OffloadingConnectorScheduler:
         live.update(
             req_id
             for req_id, req_status in self._req_status.items()
-            if req_status.load_sources
+            if req_status.committed_plan is not None
             and req_status.req.status is RequestStatus.WAITING_FOR_REMOTE_KVS
         )
         return live
@@ -1883,8 +2018,9 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
-        # The request will not load what it committed; the manager releases
+        # The request will not load its committed plan; the manager releases
         # the pins at on_request_finished.
+        req_status.clear_plan()
         req_status.load_sources.clear()
 
         # Update offload keys with final block hash so the store handlers can
@@ -1950,6 +2086,7 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
+            status.clear_plan()
             status.load_sources.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
