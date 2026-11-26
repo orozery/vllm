@@ -207,6 +207,23 @@ class SchedulerOffloadConfig(NamedTuple):
             and spec.tokens_per_hash % dcp_world_size == 0
         )
 
+        if any(group.prefix_replay_tokens for group in kv_cache_config.kv_cache_groups):
+            # Core trims a hit to its block size when a sliding-window group
+            # replays the hit's last window. A full-attention load then reads a
+            # prefix of what was committed; a sliding-window or recurrent load
+            # would shift onto keys the commit never covered.
+            windowed = [
+                config.group_idx
+                for config in kv_group_configs
+                if config.sliding_window_size_in_chunks is not None
+                or config.requires_cow_source
+            ]
+            if windowed:
+                raise ValueError(
+                    "KV offloading with sliding-window prefix replay supports only "
+                    f"full-attention groups, but would offload groups {windowed}."
+                )
+
         if retention_interval is not None:
             if retention_interval < 0:
                 raise ValueError(
@@ -260,6 +277,26 @@ class RequestGroupState:
     lookup_hit_end_chunk_idx: int = 0
 
 
+class LoadPlanInputs(NamedTuple):
+    """The inputs a committed load plan was computed from."""
+
+    local_prefix_tokens: int
+    max_load_tokens: int | None
+    max_num_new_tokens: int | None
+    # Last key per group; detects a rebuilt token sequence of equal length.
+    group_tail_keys: tuple[OffloadKey, ...]
+
+
+class CommittedLoadPlan(NamedTuple):
+    """A request's committed load, reported once its keys are readable."""
+
+    # Every key the load will read.
+    keys: tuple[OffloadKey, ...]
+    num_hit_tokens: int
+    partial_tail_boundary: int | None
+    inputs: LoadPlanInputs
+
+
 @dataclass(slots=True)
 class RequestOffloadState:
     config: SchedulerOffloadConfig
@@ -287,14 +324,17 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
-
     # A load for this request failed; all its later lookups, including after
     # preemption, skip the offloaded cache so a faulting load is not retried.
     load_failed: bool = False
-
-    # Sources returned by the commit, kept for
+    # Kept until its keys are readable; consumed by update_state_after_alloc().
+    committed_plan: CommittedLoadPlan | None = None
+    # Sources returned by the commit, kept past plan consumption for
     # get_external_cache_hit_sources().
     load_sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
+
+    def clear_plan(self) -> None:
+        self.committed_plan = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
