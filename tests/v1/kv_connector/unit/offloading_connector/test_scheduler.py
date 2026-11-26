@@ -1500,8 +1500,9 @@ def test_shared_prefix_junction_is_not_lowered():
     assert request.shared_prefix_boundary == 24
 
 
-def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
-    """A pending chunk outside the converged hit must not hide the junction."""
+def _make_pending_attention_scheduler():
+    """Full attention readable to 32 with its third chunk pending; two
+    window-16 sparse groups cut the converged hit to 16."""
     config = create_vllm_config(
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
@@ -1544,10 +1545,29 @@ def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
         is not None
     )
     assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+    return scheduler, request, manager, producer, pending
+
+
+def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
+    """A pending chunk outside the converged hit must not hide the junction."""
+    scheduler, request, manager, producer, pending = _make_pending_attention_scheduler()
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
     assert request.shared_prefix_boundary == 32
     assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+
+
+def test_pending_attention_bounds_the_junction_not_the_tail_search():
+    """The split behind the junction: a pending chunk caps the readable prefix
+    the junction may use, but not the boundary the partial-tail search reaches."""
+    scheduler, request, _, _, _ = _make_pending_attention_scheduler()
+    req_status = scheduler._req_status[request.request_id]
+    req_status.update_offload_keys()
+
+    probe = scheduler_module._LookupProbe()
+    hit, search_boundary = scheduler._lookup_complete_chunks(req_status, None, probe)
+    assert (hit, search_boundary) == (16, 48)
+    assert probe.confirmed_full_attention_boundary == 32
 
 
 def test_unconfirmed_attention_does_not_register_junction():
@@ -2212,9 +2232,9 @@ def test_partial_lookup_defers_while_anchor_chunk_is_loading():
 
 
 @pytest.mark.cpu_test
-def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
-    # Like the complete-chunk lookup, a full-attention chunk that is still
-    # being stored does not defer the request; the tail is not reported.
+def test_partial_lookup_finds_a_tail_above_a_pending_anchor_chunk():
+    # The full-attention anchor chunk is present but not readable yet. The tail
+    # beyond it is still found and counted in the hit.
     scheduler = _make_partial_tail_scheduler()
     _, req_status = _make_anchored_partial_tail_request(
         scheduler, {0: {b"h6"}, 1: {b"h6"}}
@@ -2227,8 +2247,8 @@ def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
         return resident(key, req_context)
 
     scheduler.manager.lookup.side_effect = lookup
-    assert scheduler._lookup(req_status) == 0
-    assert req_status.partial_tail_boundary is None
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.partial_tail_boundary == 28
 
 
 @pytest.mark.cpu_test
@@ -4312,7 +4332,9 @@ def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
 # which is what widens the demanded set. A new member has to be added here.
 _SCAN_BEHAVIOR = {
     LookupResult.HIT: (1, 3),
-    LookupResult.HIT_PENDING: (1, None),
+    # Present and committed like a hit; only its readability is deferred,
+    # which the commit/readiness step handles, not the scan.
+    LookupResult.HIT_PENDING: (1, 3),
     LookupResult.RETRY: (3, None),
     LookupResult.MISS: (3, 0),
 }
@@ -4337,14 +4359,15 @@ def test_scan_behavior_declared_for_every_lookup_result(result: LookupResult):
     [
         (LookupResult.MISS, 2),
         (LookupResult.RETRY, None),
-        (LookupResult.HIT_PENDING, None),
+        (LookupResult.HIT_PENDING, 5),
         (LookupResult.HIT, 5),
     ],
 )
 def test_sliding_window_unaligned_initial_run(middle, expected):
     sched = _make_scheduler_with_lookup({3: middle}, default=LookupResult.HIT)
     # If the larger rightmost window misses, the earlier aligned window only
-    # needs the usual two chunks. Pending/uncertain keys must still defer.
+    # needs the usual two chunks. A pending key counts as present; only an
+    # unconverged (RETRY) lookup defers.
     assert (
         sched._sliding_window_lookup(
             to_keys([1, 2, 3, 4, 5]), 2, _EMPTY_REQ_CTX, initial_window_size=3
@@ -4399,23 +4422,19 @@ class TestMaximalPrefixLookup:
         sched = _make_scheduler_with_lookup({})
         assert _maximal_lookup(sched, []) == 0
 
-    @pytest.mark.parametrize(
-        "pending_result",
-        [LookupResult.RETRY, LookupResult.HIT_PENDING],
-    )
-    def test_pending_result_records_only_allocated_primary(
-        self,
-        pending_result: LookupResult,
-    ):
-        sched = _make_scheduler_with_lookup({1: pending_result})
+    def test_retry_records_nothing(self):
+        sched = _make_scheduler_with_lookup({1: LookupResult.RETRY})
 
         assert _maximal_lookup(sched, to_keys([1])) is None
-        if pending_result is LookupResult.HIT_PENDING:
-            _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
-                _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
-            )
-        else:
-            _as_mock(sched._events_tracker.record_lookup).assert_not_called()
+        _as_mock(sched._events_tracker.record_lookup).assert_not_called()
+
+    def test_hit_pending_records_like_a_hit(self):
+        sched = _make_scheduler_with_lookup({1: LookupResult.HIT_PENDING})
+
+        assert _maximal_lookup(sched, to_keys([1])) == 1
+        _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
+            _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
+        )
 
     def test_retry_defers(self):
         keys = to_keys([1, 2])
@@ -4444,12 +4463,12 @@ class TestMaximalPrefixLookup:
             keys[0],
         )
 
-    def test_hit_pending_defers(self):
+    def test_hit_pending_counts_as_hit(self):
         keys = to_keys([1, 2])
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT_PENDING, 2: LookupResult.HIT}
         )
-        assert _maximal_lookup(sched, keys) is None
+        assert _maximal_lookup(sched, keys) == 2
         assert _as_mock(sched.manager.lookup).call_count == 2
         assert _as_mock(sched._events_tracker.record_lookup).call_args_list == [
             call(_LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, i, key)
@@ -4457,11 +4476,11 @@ class TestMaximalPrefixLookup:
         ]
 
     def test_hit_pending_does_not_stop_scan(self):
-        """HIT_PENDING defers but does not break — scan continues until miss."""
+        """HIT_PENDING does not break — scan continues until miss."""
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT_PENDING, 2: LookupResult.MISS, 3: LookupResult.HIT}
         )
-        assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
+        assert _maximal_lookup(sched, to_keys([1, 2, 3])) == 1
         assert _as_mock(sched.manager.lookup).call_count == 2
         _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
             _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
@@ -4587,8 +4606,8 @@ class TestSlidingWindowLookup:
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT, 2: LookupResult.HIT_PENDING}
         )
-        # window=2: both count as hits, but defer_lookup is set
-        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) is None
+        # window=2: both count as hits; readability is deferred by commit.
+        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) == 2
 
     def test_hit_pending_does_not_break_streak(self):
         """HIT_PENDING in the middle of a window doesn't reset the streak."""
@@ -4596,9 +4615,7 @@ class TestSlidingWindowLookup:
             {1: LookupResult.HIT, 2: LookupResult.HIT_PENDING, 3: LookupResult.HIT}
         )
         # window=3: right-to-left finds 3(HIT),2(HIT_PENDING),1(HIT) = 3 consecutive
-        assert (
-            sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) is None
-        )
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) == 3
 
 
 # ---------------------------------------------------------------------------
