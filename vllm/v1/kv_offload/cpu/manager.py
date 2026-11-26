@@ -65,6 +65,8 @@ class CPUOffloadingManager(OffloadingManager):
     to the CachePolicy implementation.
     """
 
+    primary_hit_source = CacheHitSource.HOST
+
     def __init__(
         self,
         num_chunks: int,
@@ -220,11 +222,6 @@ class CPUOffloadingManager(OffloadingManager):
         return LookupResult.HIT
 
     @override
-    def get_load_source(
-        self, key: OffloadKey, req_context: ReqContext
-    ) -> CacheHitSource:
-        return CacheHitSource.HOST
-
     @override
     def prepare_load(
         self,

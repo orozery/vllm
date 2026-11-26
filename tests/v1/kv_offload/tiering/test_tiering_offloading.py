@@ -619,6 +619,7 @@ class TestTieringOffloadingManager:
         """Test promotion of chunks from secondary to primary tier."""
         monkeypatch.setattr(ExampleSecondaryTierManager, "cache_hit_source", source)
         chunks = to_keys(range(3))
+        self._start_request()
 
         # Manually add chunks to secondary tier (simulate previous cascade)
         for chunk in chunks:
@@ -661,9 +662,7 @@ class TestTieringOffloadingManager:
         assert count_hits(self.manager, chunks) == 3
 
         # The request that caused the promotion retains the secondary origin.
-        assert all(
-            self.manager.get_load_source(chunk, _CTX) == source for chunk in chunks
-        )
+        assert self.manager.commit_hits(chunks, _CTX) == dict.fromkeys(chunks, source)
 
         # A later request sees the chunks as ordinary host-memory primary hits.
         later_context = ReqContext(req_id="later")
@@ -672,9 +671,8 @@ class TestTieringOffloadingManager:
             self.manager.lookup(chunk, later_context) is LookupResult.HIT
             for chunk in chunks
         )
-        assert all(
-            self.manager.get_load_source(chunk, later_context) == "host"
-            for chunk in chunks
+        assert self.manager.commit_hits(chunks, later_context) == dict.fromkeys(
+            chunks, CacheHitSource.HOST
         )
 
     @pytest.mark.parametrize(
@@ -700,6 +698,7 @@ class TestTieringOffloadingManager:
     ):
         monkeypatch.setattr(ExampleSecondaryTierManager, "cache_hit_source", source)
         chunks = to_keys(range(3))
+        self._start_request()
         for chunk in chunks:
             self.secondary_tier1.chunks[chunk] = True
 
@@ -733,7 +732,7 @@ class TestTieringOffloadingManager:
             if successful_indices is None
             else {chunks[i] for i in successful_indices}
         )
-        assert set(self.manager._request_load_sources[_CTX.req_id]) == (
+        assert set(self.manager._req_state[_CTX.req_id].sources) == (
             expected_source_keys
         )
 
@@ -1789,7 +1788,7 @@ class TestTieringOffloadingManager:
         # Orchestrator state cleared.
         assert self.manager._jobs == {}
         assert self.manager._pending_load_submissions == {}
-        assert self.manager._request_load_sources == {}
+        assert not any(state.sources for state in self.manager._req_state.values())
         assert set(self.manager._req_state) == {_CTX.req_id, rl_ctx.req_id}
         assert self.manager._processed_jobs_this_step is False
 
@@ -1882,6 +1881,64 @@ class TestTieringOffloadingManager:
         ctx = ReqContext(req_id="r2", load_tier_filter=load_tier_filter)
         assert self.manager.lookup(chunks[0], ctx) is LookupResult.HIT_PENDING
         tier1_lookup.assert_called()
+
+    def test_commit_hits_reports_the_recorded_provenance(self, manager_setup):
+        resident, secondary = to_keys([30, 31])
+        self._start_request()
+        self.manager.prepare_store([resident], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [resident], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.chunks[secondary] = True
+        # The walk promotes the secondary copy and records its origin.
+        assert self.manager.lookup(secondary, _CTX) is LookupResult.HIT_PENDING
+
+        sources = self.manager.commit_hits([resident, secondary], _CTX)
+
+        assert sources == {
+            resident: CacheHitSource.HOST,
+            secondary: self.secondary_tier1.cache_hit_source,
+        }
+
+    def test_commit_hits_refuses_the_set_when_a_key_is_missing(self, manager_setup):
+        resident, missing = to_keys([32, 33])
+        self._start_request()
+        self.manager.prepare_store([resident], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [resident], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+
+        assert self.manager.commit_hits([resident, missing], _CTX) is None
+        assert self.manager._req_state[_CTX.req_id].sources == {}
+
+    def test_commit_hits_empty_set_releases_the_plan(self, manager_setup):
+        chunk = to_keys([34])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+
+        assert self.manager.commit_hits((), _CTX) is None
+        assert self.manager._req_state[_CTX.req_id].sources == {}
+
+    def test_commit_hits_repeat_reconciles_the_plan(self, manager_setup):
+        kept, dropped = to_keys([35, 36])
+        self._start_request()
+        for key in (kept, dropped):
+            self.manager.prepare_store([key], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+            self.manager.complete_store(
+                [key], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+            )
+        self._simulate_on_schedule_end()
+
+        assert self.manager.commit_hits([kept, dropped], _CTX) is not None
+        assert self.manager.commit_hits([kept], _CTX) == {kept: CacheHitSource.HOST}
+        assert set(self.manager._req_state[_CTX.req_id].sources) == {kept}
 
 
 class TestTieringOffloadingWithoutSecondaryTiers:
