@@ -48,3 +48,8 @@ CopyEngineFactory.register(
     "vllm.v1.kv_offload.cpu.engines.torch",
     "TorchCopyEngine",
 )
+CopyEngineFactory.register(
+    "nixl",
+    "vllm.v1.kv_offload.cpu.engines.nixl",
+    "NixlCopyEngine",
+)
