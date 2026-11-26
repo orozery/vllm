@@ -21,7 +21,7 @@ Key Design Principles:
 
 import threading
 import time
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -105,6 +105,9 @@ class RequestState:
     request_level_tiers: set[int] | None = None
     skip_cascade_tiers: set[int] | None = None
     pending_cascade_keys: list[OffloadKey] = field(default_factory=list)
+    # The request's committed load: keys and their provenance. Non-empty means
+    # a plan exists, and its keys are the keys the load is waiting on.
+    plan_sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
 
 
 class JobMetadata(NamedTuple):
@@ -350,11 +353,6 @@ class TieringOffloadingManager(OffloadingManager):
         # complete_store(), since complete_store() can still submit cascades.
         self._req_state: dict[str, RequestState] = {}
 
-        # Preserve the original tier for this request's cache-hit metrics,
-        # even after its KV blocks are promoted into host memory
-        # (otherwise a disk or P2P hit would be mislabeled as a host hit).
-        self._request_load_sources: dict[str, dict[OffloadKey, CacheHitSource]] = {}
-
         # Cached ParentManager wrappers for each secondary tier.
         self._tier_parents: dict[SecondaryTierManager, _SecondaryTierFacingParent] = {
             tier: _SecondaryTierFacingParent(self, tier_idx)
@@ -573,12 +571,12 @@ class TieringOffloadingManager(OffloadingManager):
             successful_keys = ()
             failed_keys = transfer_job.keys
 
-        load_sources = self._request_load_sources.get(transfer_job.req_context.req_id)
-        if load_sources is not None:
+        state = self._req_state.get(transfer_job.req_context.req_id)
+        if state is not None:
             source = self.secondary_tiers[job_metadata.tier_idx].cache_hit_source
             for key in failed_keys:
-                if load_sources.get(key) == source:
-                    del load_sources[key]
+                if state.plan_sources.get(key) == source:
+                    del state.plan_sources[key]
 
         if successful_keys:
             self.primary_tier.complete_write(
@@ -808,13 +806,59 @@ class TieringOffloadingManager(OffloadingManager):
         return LookupResult.MISS
 
     @override
-    def get_load_source(
-        self, key: OffloadKey, req_context: ReqContext
-    ) -> CacheHitSource:
-        load_sources = self._request_load_sources.get(req_context.req_id)
-        if load_sources is not None and key in load_sources:
-            return load_sources[key]
-        return self.primary_tier.get_load_source(key, req_context)
+    def commit_hits(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> Mapping[OffloadKey, CacheHitSource] | None:
+        """Record the set a request will read and return its provenance.
+
+        The lookup walk promotes and records first; this call reconciles the
+        recorded set with what the request will actually read, refuses the
+        whole set if a key is not present, and returns the key -> source map.
+        All-or-nothing: a set it cannot take is released and None returned.
+
+        Runs while the request is considered for scheduling, before its device
+        blocks are allocated. An empty set releases the plan.
+
+        Args:
+            keys: Every key the load will read.
+            req_context: Per-request context.
+
+        Returns:
+            A mapping from each key to the tier it came from, or None if part
+            of the set cannot be served from offloaded cache.
+
+        """
+        self._maybe_process_finished_jobs()
+        keys = list(dict.fromkeys(keys))
+        req_id = req_context.req_id
+        state = self._req_state[req_id]
+
+        wanted = set(keys)
+        for key in [k for k in state.plan_sources if k not in wanted]:
+            del state.plan_sources[key]
+
+        # A recorded key can be evicted while the plan waits; check every key.
+        for key in keys:
+            if self.primary_tier.lookup(key, req_context) is LookupResult.MISS:
+                self._release_plan(req_id)
+                return None
+
+        # Only keys new to the plan need classifying.
+        new_keys = [key for key in keys if key not in state.plan_sources]
+        if not new_keys:
+            if not keys:
+                self._release_plan(req_id)
+                return None
+            return {key: state.plan_sources[key] for key in keys}
+
+        state.plan_sources.update(dict.fromkeys(new_keys, CacheHitSource.HOST))
+        return {key: state.plan_sources[key] for key in keys}
+
+    def _release_plan(self, req_id: str) -> None:
+        """Drop a request's recorded plan."""
+        state = self._req_state.get(req_id)
+        if state is not None:
+            state.plan_sources.clear()
 
     def _initiate_promotion(
         self,
@@ -853,10 +897,11 @@ class TieringOffloadingManager(OffloadingManager):
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
-        load_sources = self._request_load_sources.setdefault(req_context.req_id, {})
-        source = self.secondary_tiers[tier_idx].cache_hit_source
-        for promoted_key in primary_write_result.keys_to_store:
-            load_sources[promoted_key] = source
+        state = self._req_state.get(req_context.req_id)
+        if state is not None:
+            source = self.secondary_tiers[tier_idx].cache_hit_source
+            for promoted_key in primary_write_result.keys_to_store:
+                state.plan_sources[promoted_key] = source
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
         # each request's chunks are submitted as one batched job per tier.
         tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
@@ -1212,7 +1257,6 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             tier.on_request_finished(state.req_context)
         self._metrics.on_request_finished(state.req_context)
-        self._request_load_sources.pop(req_id, None)
         del self._req_state[req_id]
 
     @override
@@ -1325,7 +1369,8 @@ class TieringOffloadingManager(OffloadingManager):
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
-        self._request_load_sources.clear()
+        for state in self._req_state.values():
+            state.plan_sources.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []

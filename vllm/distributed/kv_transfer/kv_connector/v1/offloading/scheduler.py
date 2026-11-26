@@ -78,6 +78,14 @@ MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
 
 
+@dataclass(slots=True)
+class _LookupProbe:
+    """What one lookup walk learned beyond the hit count."""
+
+    # Keys the walk saw readable.
+    ready_keys: set[OffloadKey] = field(default_factory=set)
+
+
 def _parse_tier_filter(raw: Any) -> TierFilter:
     """Parse raw kv_transfer_params tier matchers into a TierFilter."""
     if not isinstance(raw, list):
@@ -479,6 +487,7 @@ class OffloadingConnectorScheduler:
         req: Request,
         group_config: GroupOffloadConfig,
         start_chunk_idx: int,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
@@ -494,6 +503,8 @@ class OffloadingConnectorScheduler:
                         start_chunk_idx + local_idx,
                         key,
                     )
+                    if result is LookupResult.HIT and probe is not None:
+                        probe.ready_keys.add(key)
                     hit_count += 1
                     defer_lookup |= result is LookupResult.HIT_PENDING
                 case LookupResult.RETRY:
@@ -510,6 +521,7 @@ class OffloadingConnectorScheduler:
         sliding_window_size: int,
         req_context: ReqContext,
         initial_window_size: int | None = None,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
@@ -522,6 +534,8 @@ class OffloadingConnectorScheduler:
         for idx in range(len(keys) - 1, -1, -1):
             match self.manager.lookup(keys[idx], req_context):
                 case LookupResult.HIT:
+                    if probe is not None:
+                        probe.ready_keys.add(keys[idx])
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
                     # Block is in cache, just not readable yet — counts
@@ -552,6 +566,7 @@ class OffloadingConnectorScheduler:
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
+        probe: _LookupProbe | None = None,
     ) -> tuple[int | None, int | None]:
         """Find how many tokens beyond num_locally_computed_tokens can be loaded.
 
@@ -659,6 +674,7 @@ class OffloadingConnectorScheduler:
                         req_status.req,
                         group_config,
                         start_chunk_idx,
+                        probe,
                     )
                     full_attention_deferred |= num_hit_chunks is None
                     group_state.lookup_hit_end_chunk_idx = start_chunk_idx + (
@@ -679,6 +695,7 @@ class OffloadingConnectorScheduler:
                         required_window,
                         req_status.req_context,
                         initial_window,
+                        probe,
                     )
                 if num_hit_chunks == 0:
                     return 0, full_attention_hit_boundary
@@ -756,12 +773,19 @@ class OffloadingConnectorScheduler:
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
+        if probe is None:
+            probe = _LookupProbe()
         complete_hit, full_attention_hit_boundary = self._lookup_complete_chunks(
-            req_status, max_num_new_tokens
+            req_status, max_num_new_tokens, probe
         )
         num_hit_tokens = self._lookup_partial_tail_hit(
-            req_status, complete_hit, full_attention_hit_boundary, max_num_new_tokens
+            req_status,
+            complete_hit,
+            full_attention_hit_boundary,
+            max_num_new_tokens,
+            probe,
         )
         if num_hit_tokens is not None and full_attention_hit_boundary is not None:
             self._maybe_register_shared_prefix_junction(
@@ -775,6 +799,7 @@ class OffloadingConnectorScheduler:
         complete_hit: int | None,
         full_attention_hit_boundary: int | None,
         max_num_new_tokens: int | None,
+        probe: _LookupProbe | None = None,
     ) -> int | None:
         """Extend a complete-chunk hit with a partial tail, if supported."""
         req_status.partial_tail_boundary = None
@@ -855,7 +880,7 @@ class OffloadingConnectorScheduler:
                 continue
             loads_bridge = boundary >= bridge_boundary
             hit, boundary_pending = self._lookup_partial_tail(
-                req_status, boundary, loads_bridge and bridge_pending
+                req_status, boundary, loads_bridge and bridge_pending, probe
             )
             if hit:
                 # The complete-chunk lookup recorded the confirmed bridge keys.
@@ -877,6 +902,7 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         boundary: int,
         bridge_pending: bool,
+        probe: _LookupProbe | None = None,
     ) -> tuple[bool, bool]:
         """Look up every key a partial-tail hit at `boundary` loads.
 
@@ -899,6 +925,8 @@ class OffloadingConnectorScheduler:
             result = self.manager.lookup(key, req_context)
             if result is LookupResult.MISS:
                 return False, False
+            if result is LookupResult.HIT and probe is not None:
+                probe.ready_keys.add(key)
             pending |= result is not LookupResult.HIT
             boundary_keys.append((group_config, key))
 
@@ -995,6 +1023,7 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
+        probe = _LookupProbe()
         if (
             request.skip_reading_external_kv
             or req_status.load_failed
@@ -1007,7 +1036,10 @@ class OffloadingConnectorScheduler:
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
-            num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
+            num_hit_tokens = self._lookup(req_status, max_num_new_tokens, probe)
+            if num_hit_tokens:
+                # The commit's wait is part of the lookup's async delay.
+                num_hit_tokens = self._commit_load(req_status, num_hit_tokens, probe)
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1023,6 +1055,96 @@ class OffloadingConnectorScheduler:
             req_status, num_computed_tokens, num_hit_tokens
         )
         return num_hit_tokens, bool(num_hit_tokens) and not sync_load
+
+    def _commit_load(
+        self,
+        req_status: RequestOffloadState,
+        num_hit_tokens: int,
+        probe: _LookupProbe,
+    ) -> int | None:
+        """Commit the keys the load will read.
+
+        Returns the hit count once the committed set is readable, None while
+        pending, and 0 if the set cannot be committed.
+        """
+        num_cached_tokens = req_status.num_locally_computed_tokens + num_hit_tokens
+        keys = self._keys_to_commit(req_status, num_cached_tokens)
+        if not keys:
+            # Nothing to read from offloaded memory; prefill instead.
+            return 0
+
+        # Keys the walk did not see readable: check them before committing, so
+        # an unconverged lookup defers instead of refusing the whole set. The
+        # lookup also starts the tier's async resolution.
+        unverified: dict[OffloadKey, LookupResult] = {}
+        for key in keys:
+            if key in probe.ready_keys:
+                continue
+            result = self.manager.lookup(key, req_status.req_context)
+            if result is LookupResult.RETRY:
+                return None
+            unverified[key] = result
+
+        # Commit to the keys this load reads; None means they cannot all be served.
+        sources = self.manager.commit_hits(keys, req_status.req_context)
+        if sources is None:
+            logger.debug(
+                "Offloading manager refused to commit %d keys for %s; "
+                "recomputing instead of waiting",
+                len(keys),
+                req_status.req.request_id,
+            )
+            req_status.partial_tail_boundary = None
+            req_status.load_sources = {}
+            return 0
+
+        req_status.load_sources = dict(sources)
+        unreadable = [
+            key for key, result in unverified.items() if result is not LookupResult.HIT
+        ]
+        if unreadable:
+            logger.debug(
+                "Offloading manager committed %d keys for %s with %d unreadable; "
+                "deferring until the committed set is readable",
+                len(keys),
+                req_status.req.request_id,
+                len(unreadable),
+            )
+            return None
+        return num_hit_tokens
+
+    def _keys_to_commit(
+        self, req_status: RequestOffloadState, num_cached_tokens: int
+    ) -> list[OffloadKey]:
+        """Return the offload keys a load to `num_cached_tokens` reads."""
+        partial_tail_boundary = req_status.partial_tail_boundary
+        local_tokens = req_status.num_locally_computed_tokens
+        keys: list[OffloadKey] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
+            end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
+            start_chunk_idx = local_tokens // tokens_per_chunk
+            # Sparse groups load only their window; a partial tail is
+            # appended below.
+            window = group_config.load_window_size_in_chunks(num_cached_tokens)
+            if window is not None:
+                start_chunk_idx = max(start_chunk_idx, num_chunks - window)
+            offload_keys = group_state.offload_keys
+            assert len(offload_keys) >= end_chunk_idx, (
+                f"request {req_status.req.request_id} has "
+                f"{len(offload_keys)} offload keys, needs {end_chunk_idx}"
+            )
+            keys.extend(offload_keys[start_chunk_idx:end_chunk_idx])
+            if partial_tail_boundary is not None:
+                keys.append(
+                    req_status.register_boundary_key(
+                        group_config.group_idx, partial_tail_boundary
+                    )
+                )
+        return keys
 
     def _reserve_sync_load(
         self,
@@ -1071,12 +1193,13 @@ class OffloadingConnectorScheduler:
         events: list[tuple[int, int, CacheHitSource]] = [
             (end, 0, CacheHitSource.EXTERNAL_UNSPECIFIED)
         ]
+        load_sources = req_status.load_sources
         for lo, hi, key in req_status.load_key_ranges:
             lo, hi = max(start, lo), min(end, hi)
             if lo >= hi:
                 continue
             source = CacheHitSource(
-                self.manager.get_load_source(key, req_status.req_context)
+                load_sources.get(key, CacheHitSource.EXTERNAL_UNSPECIFIED)
             )
             events.extend(((lo, 1, source), (hi, -1, source)))
 
@@ -1126,6 +1249,11 @@ class OffloadingConnectorScheduler:
             )
 
         if num_external_tokens == 0:
+            # Core dropped the external hit after the connector committed it.
+            # Release whatever the commit took; a no-op if nothing was.
+            self._acquire_step()
+            self.manager.commit_hits((), req_status.req_context)
+            req_status.load_sources = {}
             return
 
         # prepare_load() below pins keys that get_num_new_matched_tokens()

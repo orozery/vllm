@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import OrderedDict
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from typing_extensions import override
@@ -220,10 +220,15 @@ class CPUOffloadingManager(OffloadingManager):
         return LookupResult.HIT
 
     @override
-    def get_load_source(
-        self, key: OffloadKey, req_context: ReqContext
-    ) -> CacheHitSource:
-        return CacheHitSource.HOST
+    def commit_hits(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> Mapping[OffloadKey, CacheHitSource] | None:
+        # Nothing to reserve: a present key is committable even while pending.
+        if not keys or any(
+            self.lookup(key, req_context) is LookupResult.MISS for key in keys
+        ):
+            return None
+        return dict.fromkeys(keys, CacheHitSource.HOST)
 
     @override
     def prepare_load(
