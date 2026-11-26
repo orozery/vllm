@@ -251,8 +251,13 @@ This class runs in the scheduler, tracks which blocks are offloaded
 and their address.
 
 The class provides the following primitives:
-    lookup() - check whether a single block is offloaded and ready.
-    prepare_load() - prepare given blocks to be read.
+    lookup() - report whether a single block is offloaded and readable.
+        Non-binding: nothing is reserved or transferred by the call.
+    commit_hits() - commit to reading the looked-up block set.
+        Allocates and pins what the load needs across the whole set at once,
+        and reports each block's provenance. Returns no LoadSpec: a promoted
+        block becomes readable only after commit_hits returns.
+    prepare_load() - prepare committed blocks to be read.
         The given blocks will be protected from eviction.
         This function returns a LoadSpec which encapsulates
         information required for performing the load.
@@ -368,16 +373,23 @@ class OffloadingManager(ABC):
 
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        """Checks whether a single block is offloaded and ready to be read.
+        """Report whether a single block is offloaded and readable, without
+        committing to it.
+
+        A lookup reserves nothing and starts no transfer. The connector may
+        look up more blocks than it later reads, and commits the set it reads
+        with one `commit_hits` call.
 
         Args:
             key: the key identifying the block to lookup.
             req_context: per-request context (e.g. kv_transfer_params).
 
         Returns:
-            HIT if the block is offloaded and ready, MISS if not found,
-            HIT_PENDING if found but not yet readable, or RETRY if the
-            lookup should be retried later.
+            HIT if the block is readable now.
+            HIT_PENDING if it is present but not readable yet; look it up
+                again later.
+            MISS if it is not present in any allowed tier.
+            RETRY if a tier's state has not converged; look it up again.
 
         """
         pass
@@ -431,6 +443,11 @@ class OffloadingManager(ABC):
         The given blocks will be protected from eviction until
         complete_load is called.
         It assumes all given blocks are offloaded.
+
+        Called after the scheduler allocates the request's device blocks, so
+        it is the first sign that a committed set will actually be read. It
+        transfers the claim pins to the load; if it never arrives, the
+        claim is released at request finish or cache reset.
 
         Args:
             keys: the keys identifying the blocks.

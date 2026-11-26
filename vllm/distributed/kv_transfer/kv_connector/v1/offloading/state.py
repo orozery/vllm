@@ -287,12 +287,12 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
-    # Sources returned by the commit, kept for
-    # get_external_cache_hit_sources().
-    load_sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
     # A load for this request failed; all its later lookups, including after
     # preemption, skip the offloaded cache so a faulting load is not retried.
     load_failed: bool = False
+    # Sources returned by the commit, kept for
+    # get_external_cache_hit_sources().
+    load_sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(

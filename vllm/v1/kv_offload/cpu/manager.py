@@ -222,7 +222,6 @@ class CPUOffloadingManager(OffloadingManager):
         return LookupResult.HIT
 
     @override
-    @override
     def prepare_load(
         self,
         keys: Collection[OffloadKey],

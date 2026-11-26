@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections import Counter
-from collections.abc import Collection, Generator, Iterable, Sequence
+from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
@@ -1062,8 +1062,8 @@ class OffloadingConnectorScheduler:
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
+        lookup_start: float | None = None
         num_hit_tokens: int | None
-        probe = _LookupProbe()
         if (
             request.skip_reading_external_kv
             or req_status.load_failed
@@ -1073,10 +1073,13 @@ class OffloadingConnectorScheduler:
             # A manager that cannot read is never queried, so it serves no
             # external hits; nor does an engine still waiting for its workers
             # (async_init).
+            req_status.load_sources = {}
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
-            num_hit_tokens = self._lookup(req_status, max_num_new_tokens, probe)
+            num_hit_tokens = self._lookup_and_commit(req_status, max_num_new_tokens)
+
+        if lookup_start is not None:
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1086,8 +1089,6 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
-        if num_hit_tokens:
-            num_hit_tokens = self._commit_load(req_status, num_hit_tokens, probe)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         sync_load = self._reserve_sync_load(
@@ -1095,17 +1096,24 @@ class OffloadingConnectorScheduler:
         )
         return num_hit_tokens, bool(num_hit_tokens) and not sync_load
 
-    def _commit_load(
+    def _lookup_and_commit(
         self,
         req_status: RequestOffloadState,
-        num_hit_tokens: int,
-        probe: _LookupProbe,
+        max_num_new_tokens: int | None,
     ) -> int | None:
-        """Commit the keys the load will read.
+        """Walk, then commit the keys the load will read.
 
-        Returns the hit count once the committed set is readable, None while
-        pending, and 0 if the set cannot be committed.
+        Returns the hit count once readable, None while pending, and 0 if the
+        set cannot be committed.
         """
+        probe = _LookupProbe()
+        num_hit_tokens = self._lookup(req_status, max_num_new_tokens, probe)
+        if num_hit_tokens is None:
+            return None
+        if num_hit_tokens == 0:
+            # No hit to commit; prefill or re-look later.
+            return 0
+
         num_cached_tokens = req_status.num_locally_computed_tokens + num_hit_tokens
         keys = self._keys_to_load(req_status, num_cached_tokens)
         if not keys:
@@ -1113,8 +1121,8 @@ class OffloadingConnectorScheduler:
             return 0
 
         # Keys the walk did not see readable: check them before committing, so
-        # an unconverged lookup defers instead of refusing the whole set. The
-        # lookup also starts the tier's async resolution.
+        # an unconverged lookup defers the request instead of refusing the
+        # whole set. The lookup below starts the tier's async resolution.
         unverified: dict[OffloadKey, LookupResult] = {}
         for key in keys:
             if key in probe.ready_keys:
@@ -1141,6 +1149,8 @@ class OffloadingConnectorScheduler:
             key for key, result in unverified.items() if result is not LookupResult.HIT
         ]
         if unreadable:
+            # A committed key the walk did not see readable (pending, or a
+            # chunk the load window added); the next poll re-checks it.
             logger.debug(
                 "Offloading manager committed %d keys for %s with %d unreadable; "
                 "deferring until the committed set is readable",
@@ -1154,7 +1164,12 @@ class OffloadingConnectorScheduler:
     def _keys_to_load(
         self, req_status: RequestOffloadState, num_cached_tokens: int
     ) -> list[OffloadKey]:
-        """Return the offload keys a load to `num_cached_tokens` reads."""
+        """Return the offload keys a load to `num_cached_tokens` reads.
+
+        The commit happens before device blocks are allocated, so it covers a
+        superset of what the load reads; `update_state_after_alloc` rebuilds
+        this set from the allocated blocks.
+        """
         partial_tail_boundary = req_status.partial_tail_boundary
         local_tokens = req_status.num_locally_computed_tokens
         keys: list[OffloadKey] = []
@@ -1228,10 +1243,10 @@ class OffloadingConnectorScheduler:
         start = req_status.num_locally_computed_tokens
         end = start + num_external_tokens
 
+        load_sources: Mapping[OffloadKey, CacheHitSource] = req_status.load_sources
         events: list[tuple[int, int, CacheHitSource]] = [
             (end, 0, CacheHitSource.EXTERNAL_UNSPECIFIED)
         ]
-        load_sources = req_status.load_sources
         for lo, hi, key in req_status.load_key_ranges:
             lo, hi = max(start, lo), min(end, hi)
             if lo >= hi:
@@ -1287,11 +1302,13 @@ class OffloadingConnectorScheduler:
             )
 
         if num_external_tokens == 0:
-            # Core dropped the external hit after the connector committed it.
-            # Release whatever the commit took; a no-op if nothing was.
+            # Core dropped the external hit after the connector committed it
+            # (e.g. the local partial tail won). Release whatever the commit
+            # took; a no-op for a request with nothing committed.
             self._acquire_step()
             self.manager.commit_hits((), req_status.req_context)
             req_status.load_sources = {}
+            req_status.partial_tail_boundary = None
             return
 
         # prepare_load() below pins keys that get_num_new_matched_tokens()
@@ -1869,6 +1886,9 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
+        # The request will not load what it committed; the manager releases
+        # the pins at on_request_finished.
+        req_status.load_sources.clear()
 
         # Update offload keys with final block hash so the store handlers can
         # create store jobs for the last block(s) on the next schedule step.
@@ -1933,6 +1953,7 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
+            status.load_sources.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

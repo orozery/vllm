@@ -221,8 +221,8 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager = MagicMock(spec=OffloadingManager)
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
-        self.manager.prepare_store.return_value.keys_to_retry = []
         self.manager.commit_hits.return_value = {}
+        self.manager.prepare_store.return_value.keys_to_retry = []
         self.manager.on_schedule_end.return_value = StepResult()
         self.manager.config_info.return_value = [{}]
         self.manager.on_new_request.return_value = RequestOffloadingContext()

@@ -1901,6 +1901,21 @@ def test_external_cache_hit_sources_range_boundaries(ranges, expected):
     assert sum(result.values()) == 12
 
 
+def test_external_cache_hit_sources_prefer_the_commit_map():
+    """The connector uses the map commit_hits returned, not a manager round-trip."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    state = scheduler._req_status[request.request_id]
+    state.num_locally_computed_tokens = 0
+    key = make_offload_key(b"h3", 0)
+    state.load_key_ranges.append((0, 16, key))
+    state.load_sources = {key: CacheHitSource.DISK}
+
+    assert scheduler.get_external_cache_hit_sources(request, 16) == {
+        CacheHitSource.DISK: 16
+    }
+
+
 @pytest.mark.parametrize("source", ["host", "disk", "p2p", "external_unspecified"])
 def test_external_cache_hit_sources_recurrent_only_state(source):
     scheduler = _make_partial_tail_scheduler(recurrent_only=True)
@@ -2074,85 +2089,6 @@ def _resident_lookup(hits: dict[int, set[bytes]]):
     return lookup
 
 
-@pytest.mark.cpu_test
-def test_commit_covers_the_keys_the_load_reads():
-    scheduler = _make_partial_tail_scheduler()
-    request, req_status = _make_anchored_partial_tail_request(
-        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
-    )
-
-    matched, _ = scheduler.get_num_new_matched_tokens(request, 0)
-    assert matched > 0
-    (committed, _) = scheduler.manager.commit_hits.call_args.args
-    expected = scheduler._keys_to_load(
-        req_status, req_status.num_locally_computed_tokens + matched
-    )
-    assert list(committed) == expected
-
-
-@pytest.mark.cpu_test
-def test_commit_refusal_prefills_without_preparing_a_load():
-    scheduler = _make_partial_tail_scheduler()
-    request, _ = _make_anchored_partial_tail_request(
-        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
-    )
-    manager = scheduler.manager
-    manager.commit_hits.return_value = None
-    prepare_load = MagicMock(wraps=manager.prepare_load)
-    manager.prepare_load = prepare_load
-
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
-    prepare_load.assert_not_called()
-
-
-@pytest.mark.cpu_test
-def test_committed_set_must_be_readable_before_the_hit_is_reported():
-    scheduler = _make_partial_tail_scheduler()
-    request, _ = _make_anchored_partial_tail_request(
-        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
-    )
-    manager = scheduler.manager
-
-    def walk(req_status, max_new=None, probe=None):
-        return 10
-
-    scheduler._lookup = walk
-    manager.commit_hits.return_value = {make_offload_key(b"h3", 0): CacheHitSource.HOST}
-    manager.lookup.side_effect = None
-    manager.lookup.return_value = LookupResult.HIT_PENDING
-
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
-    manager.commit_hits.assert_called_once()
-
-    manager.lookup.return_value = LookupResult.HIT
-    assert scheduler.get_num_new_matched_tokens(request, 0)[0] == 10
-
-
-@pytest.mark.cpu_test
-def test_deferred_load_keeps_its_plan_live():
-    """An accepted async load whose callback the core defers keeps its plan
-    live, so the end-of-step hook does not release the pins it will rely on."""
-    scheduler = _make_partial_tail_scheduler()
-    request, req_status = _make_anchored_partial_tail_request(
-        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
-    )
-    scheduler.manager.commit_hits.return_value = {
-        make_offload_key(b"h3", 0): CacheHitSource.HOST
-    }
-    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
-    assert req_status.load_sources
-    output = MagicMock()
-    output.num_scheduled_tokens = {}
-
-    # Waiting for device blocks: the plan is not live.
-    request.status = RequestStatus.WAITING
-    assert scheduler._live_plan_req_ids(output) == set()
-
-    # The load was accepted; only its deferred callback is outstanding.
-    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-    assert scheduler._live_plan_req_ids(output) == {"req"}
-
-
 def _make_anchored_partial_tail_request(scheduler, hits, num_tokens=30):
     """16-token chunks, hash 4: FA chunk [0,16) is h3, [16,32) is h7; a
     30-token prompt's tail at 28 is h6. `hits` holds what each group has
@@ -2238,6 +2174,90 @@ def test_partial_lookup_defers_only_for_viable_pending_boundary(
 
     scheduler.manager.lookup.side_effect = lookup
     assert scheduler.get_num_new_matched_tokens(request, 0) == (expected, False)
+
+
+@pytest.mark.cpu_test
+def test_deferred_load_keeps_its_plan_live():
+    """An accepted async load whose callback the core defers keeps its plan
+    live, so the end-of-step hook does not release the pins it will rely on."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    scheduler.manager.commit_hits.return_value = {
+        make_offload_key(b"h3", 0): CacheHitSource.HOST
+    }
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.load_sources
+    output = MagicMock()
+    output.num_scheduled_tokens = {}
+
+    # Waiting for device blocks: the plan is not live.
+    request.status = RequestStatus.WAITING
+    assert scheduler._live_plan_req_ids(output) == set()
+
+    # The load was accepted; only its deferred callback is outstanding.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._live_plan_req_ids(output) == {"req"}
+
+
+@pytest.mark.cpu_test
+def test_unconverged_lookup_defers_before_commit():
+    """A key the walk did not confirm that is still converging defers the
+    request instead of refusing the whole committed set."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+
+    # The walk reports a hit but confirms no key, so every key is re-checked.
+    def walk(req_status, max_new=None, probe=None):
+        return 10
+
+    scheduler._lookup = walk
+    manager = scheduler.manager
+    manager.lookup.side_effect = None
+    manager.lookup.return_value = LookupResult.RETRY
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    manager.commit_hits.assert_not_called()
+
+    manager.lookup.return_value = LookupResult.HIT
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] == 10
+    manager.commit_hits.assert_called_once()
+
+
+@pytest.mark.cpu_test
+def test_no_commit_when_lookup_finds_no_hits():
+    """A request with no hits must not reach the manager's commit."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.MISS
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    scheduler.manager.commit_hits.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_zero_external_tokens_releases_plan_without_prepare_load():
+    """No hits means no load: release a committed plan, never prepare one."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    prepare_load = MagicMock(wraps=scheduler.manager.prepare_load)
+    scheduler.manager.prepare_load = prepare_load
+    commit_hits = scheduler.manager.commit_hits
+
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    commit_hits.reset_mock()
+    prepare_load.reset_mock()
+
+    # Core dropped the hit (for example the local partial tail won).
+    scheduler.update_state_after_alloc(request, KVCacheBlocks(()), 0)
+
+    commit_hits.assert_called_once_with((), req_status.req_context)
+    prepare_load.assert_not_called()
+    assert req_status.load_sources == {}
 
 
 @pytest.mark.cpu_test
@@ -4086,9 +4106,9 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        # Group 0 (full attn): prefix lookup hits 3 â†’ loads blocks 0,1,2
+        # Group 0 (full attn): prefix lookup hits 3 → loads blocks 0,1,2
         # Group 1 (sliding window, window=2): only the last 2 blocks
-        #   are within the window â†’ loads blocks 1,2
+        #   are within the window → loads blocks 1,2
         expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
     )
 
@@ -4098,9 +4118,9 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     runner.manager.lookup.return_value = LookupResult.HIT
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
-        # Group 0 (full attn): prefix lookup hits 3 â†’ loads blocks 0,1,2
+        # Group 0 (full attn): prefix lookup hits 3 → loads blocks 0,1,2
         # Group 1 (sliding window, window=2): only the last 2 blocks
-        #   are within the window â†’ loads blocks 1,2
+        #   are within the window → loads blocks 1,2
         expected_loaded=((0, 3), (1, 3)),
     )
 

@@ -789,15 +789,26 @@ def test_pd_partial_promotion_does_not_refetch_tail():
             if msg[TYPE_KEY] == FetchMsg.TYPE
         ]
 
-    expected = [LookupResult.HIT_PENDING, LookupResult.HIT_PENDING, LookupResult.MISS]
-    assert prefix_lookup() == expected
+    # Discovery reports every present key as HIT_PENDING; whether the primary
+    # can take all three is the commit's decision, not lookup's.
+    assert prefix_lookup() == [LookupResult.HIT_PENDING] * 3
+
+    # Only the chunks the primary can take are committed, which issues the
+    # single PD fetch.
+    assert tiering.commit_hits(prompt[:2], ctx) is not None
     tiering.on_schedule_end(ScheduleEndContext(new_req_ids=(), preempted_req_ids=()))
     assert sent_fetch_rounds() == [0]
 
-    # Free space before the deferred rescan: the tail must still MISS.
+    # Free space before the deferred rescan. The PD fetch was already
+    # submitted, so the tail is no longer offered and no second fetch is
+    # issued.
     primary.complete_write([filler], other, success=False)
     assert primary._get_num_free_chunks() == 1
-    assert prefix_lookup() == expected
+    assert prefix_lookup() == [
+        LookupResult.HIT_PENDING,
+        LookupResult.HIT_PENDING,
+        LookupResult.MISS,
+    ]
     tiering.on_schedule_end(ScheduleEndContext(new_req_ids=(), preempted_req_ids=()))
     assert sent_fetch_rounds() == [0]
 
