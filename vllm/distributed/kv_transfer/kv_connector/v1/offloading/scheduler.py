@@ -66,7 +66,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadAccessMode
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -1506,6 +1506,22 @@ class OffloadingConnectorScheduler:
                     self._current_batch_jobs_to_flush.add(job_id)
         return job_id
 
+    def _live_plan_req_ids(self, scheduler_output: SchedulerOutput) -> set[str]:
+        """Requests whose committed plan must keep its pins this step.
+
+        A scheduled request reads its plan now. A request whose async load the
+        core accepted but deferred `update_state_after_alloc` still waits on
+        that callback, so its plan must survive until the deferred drain.
+        """
+        live = set(scheduler_output.num_scheduled_tokens)
+        live.update(
+            req_id
+            for req_id, req_status in self._req_status.items()
+            if req_status.load_sources
+            and req_status.req.status is RequestStatus.WAITING_FOR_REMOTE_KVS
+        )
+        return live
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1537,6 +1553,7 @@ class OffloadingConnectorScheduler:
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
+            live_plan_req_ids=self._live_plan_req_ids(scheduler_output),
         )
 
         # Flush jobs for preempted requests.

@@ -2180,6 +2180,31 @@ def test_partial_lookup_defers_only_for_viable_pending_boundary(
 
 
 @pytest.mark.cpu_test
+def test_deferred_load_keeps_its_plan_live():
+    """An accepted async load whose callback the core defers keeps its plan
+    live, so the end-of-step hook does not release the pins it will rely on."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    scheduler.manager.commit_hits.return_value = {
+        make_offload_key(b"h3", 0): CacheHitSource.HOST
+    }
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.load_sources
+    output = MagicMock()
+    output.num_scheduled_tokens = {}
+
+    # Waiting for device blocks: the plan is not live.
+    request.status = RequestStatus.WAITING
+    assert scheduler._live_plan_req_ids(output) == set()
+
+    # The load was accepted; only its deferred callback is outstanding.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._live_plan_req_ids(output) == {"req"}
+
+
+@pytest.mark.cpu_test
 def test_partial_lookup_requires_resident_full_attention_prefix():
     # Tail keys resident but the chunk [0,16) was evicted: reporting the tail
     # would make the load request a missing chunk.
