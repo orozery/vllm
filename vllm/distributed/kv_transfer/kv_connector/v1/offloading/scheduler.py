@@ -1082,6 +1082,7 @@ class OffloadingConnectorScheduler:
             # A manager that cannot read is never queried, so it serves no
             # external hits; nor does an engine still waiting for its workers
             # (async_init).
+            req_status.load_sources = {}
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
@@ -1298,11 +1299,13 @@ class OffloadingConnectorScheduler:
             )
 
         if num_external_tokens == 0:
-            # Core dropped the external hit after the connector committed it.
-            # Release whatever the commit took; a no-op if nothing was.
+            # Core dropped the external hit after the connector committed it
+            # (e.g. the local partial tail won). Release whatever the commit
+            # took; a no-op for a request with nothing committed.
             self._acquire_step()
             self.manager.commit_hits((), req_status.req_context)
             req_status.load_sources = {}
+            req_status.partial_tail_boundary = None
             return
 
         # prepare_load() below pins keys that get_num_new_matched_tokens()
@@ -1880,6 +1883,9 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
+        # The request will not load what it committed; the manager releases
+        # the pins at on_request_finished.
+        req_status.load_sources.clear()
 
         # Update offload keys with final block hash so the store handlers can
         # create store jobs for the last block(s) on the next schedule step.
@@ -1944,6 +1950,7 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
+            status.load_sources.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

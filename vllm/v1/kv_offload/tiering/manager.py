@@ -13,8 +13,10 @@ Key Design Principles:
    directly; all data flows through the CPU primary tier
 3. Staged promotion — Chunks in secondary tiers must be promoted to the
    primary tier before GPU can access them
-4. Transparent retry mechanism — Return None from lookup() to signal
-   "data is being promoted, try later"
+4. Discovery is separate from commitment — lookup() never allocates or
+   promotes. commit_hits() commits a request's set; claim_hits() claims one
+   for a peer. A promoted chunk is not readable until its transfer completes,
+   so commit_hits() reports provenance, not a load spec.
 5. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
    protecting chunks from eviction until complete_read() is called
 """
@@ -111,6 +113,9 @@ class RequestState:
     plan_sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
     # Commit pins held on readable chunks.
     commit_pins: set[OffloadKey] = field(default_factory=set)
+    # Keys whose promotion failed; lookup reports them MISS. A released plan
+    # keeps them, so a re-plan does not promote them again.
+    failed_writes: set[OffloadKey] = field(default_factory=set)
 
 
 class JobMetadata(NamedTuple):
@@ -354,8 +359,9 @@ class TieringOffloadingManager(OffloadingManager):
             primary_chunk_size=primary_view.strides[0],
         )
 
-        # Pending promotion requests accumulated during lookup() calls; flushed
-        # as one batched submit_load() per (tier, request) in on_schedule_end().
+        # Pending promotion requests accumulated during commit_hits() and
+        # claim_hits() calls; flushed as one batched submit_load() per
+        # (tier, request) in on_schedule_end().
         # Outer key: tier index. Inner key: req_context.req_id — the same ReqContext
         # object is reused for all chunk lookups of a given request per engine step.
         self._pending_load_submissions: dict[int, dict[str, PendingPromotion]] = {}
@@ -364,9 +370,10 @@ class TieringOffloadingManager(OffloadingManager):
         # Reset at the end of each step in on_schedule_end().
         self._processed_jobs_this_step: bool = False
 
-        # Per-request state for prepared GPU->primary stores and finalization.
-        # Secondary tiers are finalized only after pending primary stores reach
-        # complete_store(), since complete_store() can still submit cascades.
+        # Per-request state for prepared GPU->primary stores, the committed
+        # load plan, and finalization. Secondary tiers are finalized only after
+        # pending primary stores reach complete_store(), since complete_store()
+        # can still submit cascades.
         self._req_state: dict[str, RequestState] = {}
 
         # Serve claims: req_id -> (key, claiming tier) -> job id holding that
@@ -520,8 +527,8 @@ class TieringOffloadingManager(OffloadingManager):
         Excludes _flush_pending_promotions() and _flush_pending_cascades() by
         design: both are per-step batching points, and running them here would
         fragment batches the scheduler thread accumulated during schedule(). A
-        promotion that a lookup() from this path initiates therefore waits for
-        the next on_schedule_end() to be submitted.
+        promotion that a claim_hits() from this path initiates therefore
+        waits for the next on_schedule_end() to be submitted.
 
         The caller must hold self.lock for the whole call. serve_external_requests()
         relies on that: it establishes lookup() HITs and then pins them, and the
@@ -594,12 +601,9 @@ class TieringOffloadingManager(OffloadingManager):
             successful_keys = ()
             failed_keys = transfer_job.keys
 
-        state = self._req_state.get(transfer_job.req_context.req_id)
-        if state is not None:
-            source = self.secondary_tiers[job_metadata.tier_idx].cache_hit_source
-            for key in failed_keys:
-                if state.plan_sources.get(key) == source:
-                    del state.plan_sources[key]
+        if failed_keys:
+            # Break every committed plan waiting on these keys.
+            self._fail_waiters(failed_keys)
 
         if successful_keys:
             self.primary_tier.complete_write(
@@ -607,6 +611,7 @@ class TieringOffloadingManager(OffloadingManager):
                 transfer_job.req_context,
                 True,
             )
+            # The slot was the only hold; keep the chunks for their waiters.
             self._pin_for_waiters(successful_keys)
         if not failed_keys:
             assert completed_job.deferred_release is None
@@ -752,13 +757,19 @@ class TieringOffloadingManager(OffloadingManager):
         *,
         exclude_tier_idx: int | None = None,
     ) -> LookupResult:
-        """Check whether a single chunk is offloaded and ready.
+        """Check whether a single chunk is offloaded and readable.
+
+        A lookup is non-binding: it may be asked about more keys than the
+        request ends up reading, and it reserves nothing. A key the primary
+        tier does not hold but a secondary tier does is HIT_PENDING --
+        present, not readable -- and becomes readable only after the caller
+        commits it with commit_hits() (request loads) or claim_hits()
+        (serve).
 
         Algorithm:
             1. Process any completed async jobs first.
             2. Query primary tier — short-circuit on hit or in-flight.
-            3. On primary miss, query secondary tiers — stop on first
-               hit and initiate promotion.
+            3. On primary miss, query secondary tiers — stop on first hit.
 
         Args:
             key: Chunk hash to look up.
@@ -767,18 +778,16 @@ class TieringOffloadingManager(OffloadingManager):
 
         Returns:
             HIT       — chunk is ready in the primary tier.
-            HIT_PENDING — chunk found but not yet readable (write
-                        in-flight on the primary tier).
-            RETRY     — promotion started or a secondary tier is busy.
-            MISS      — chunk not found in any tier, primary is full
-                        and cannot accept a promotion, or promotions are
-                        held after a cache reset (see reset_cache()).
+            HIT_PENDING — chunk is present but not yet readable: a primary
+                        write or promotion is in flight, or only a secondary
+                        copy exists and no commit has promoted it yet.
+            RETRY     — a secondary tier's lookup has not converged; retry.
+            MISS      — chunk not found in any allowed tier, or promotions
+                        are held after a cache reset (see reset_cache()).
 
         """
         # Poll first so a promotion that finished since the last call is
-        # already reflected as HIT (not stale HIT_PENDING/MISS) below, and
-        # so chunks freed by cascade or promotion completions are evictable
-        # in time for a promotion this lookup may initiate.
+        # already reflected as HIT (not stale HIT_PENDING/MISS) below.
         self._maybe_process_finished_jobs()
 
         start_time = time.monotonic()
@@ -795,6 +804,9 @@ class TieringOffloadingManager(OffloadingManager):
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
+        state = self._req_state.get(req_context.req_id)
+        if state is not None and key in state.failed_writes:
+            return LookupResult.MISS
         if self._promotions_held:
             return LookupResult.MISS
 
@@ -819,8 +831,9 @@ class TieringOffloadingManager(OffloadingManager):
                     result,
                     lookup_duration,
                 )
-                promoted = self._initiate_promotion(i, key, req_context)
-                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+                # Present in a secondary tier, but no data is moving yet:
+                # only a commit promotes it.
+                return LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
             self._metrics.on_lookup(
@@ -839,12 +852,14 @@ class TieringOffloadingManager(OffloadingManager):
     def commit_hits(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> Mapping[OffloadKey, CacheHitSource] | None:
-        """Record the set a request will read and return its provenance.
+        """Commit to reading `keys` from the primary tier.
 
-        The lookup walk promotes and records first; this call reconciles the
-        recorded set with what the request will actually read, refuses the
-        whole set if a key is not present, and returns the key -> source map.
+        Pins resident chunks, promotes every key held only by a secondary
+        tier, records provenance, and returns the key -> source map.
         All-or-nothing: a set it cannot take is released and None returned.
+
+        No spec is returned: promoted chunks are not readable yet. The caller
+        defers until every committed key is readable, then calls prepare_load.
 
         Runs while the request is considered for scheduling, before its device
         blocks are allocated; an unscheduled request's pins are released at
@@ -865,15 +880,19 @@ class TieringOffloadingManager(OffloadingManager):
         req_id = req_context.req_id
         state = self._req_state[req_id]
 
-        wanted = set(keys)
-        for key in [k for k in state.plan_sources if k not in wanted]:
-            del state.plan_sources[key]
+        # Keys dropped from the set: unpin them and withdraw their promotions.
+        stale = list(state.plan_sources.keys() - set(keys))
+        if stale:
+            self._unpin_committed(state, stale)
+            for key in stale:
+                del state.plan_sources[key]
+            self._cancel_promotions(req_id, stale)
 
-        # A recorded key can be evicted while the plan waits; check every key.
-        for key in keys:
+        # Recorded keys can be evicted while a request waits unpinned. Forget
+        # them so the classification below repairs them from a secondary copy.
+        for key in list(state.plan_sources):
             if self.primary_tier.lookup(key, req_context) is LookupResult.MISS:
-                self._release_plan(req_id)
-                return None
+                del state.plan_sources[key]
 
         # Only keys new to the plan need classifying.
         new_keys = [key for key in keys if key not in state.plan_sources]
@@ -884,8 +903,45 @@ class TieringOffloadingManager(OffloadingManager):
             self._pin_committed(state, keys)
             return {key: state.plan_sources[key] for key in keys}
 
-        state.plan_sources.update(dict.fromkeys(new_keys, CacheHitSource.HOST))
+        resident: list[OffloadKey] = []
+        inflight: list[OffloadKey] = []
+        by_tier: dict[int, list[OffloadKey]] = {}
+        for key in new_keys:
+            result, source_tier = self._locate(key, req_context)
+            if source_tier is not None and key in state.failed_writes:
+                # Promoting this key already failed for this request; do not
+                # loop. A copy that became resident is still committable.
+                self._release_plan(req_id)
+                return None
+            if result is LookupResult.HIT:
+                resident.append(key)
+            elif result is LookupResult.HIT_PENDING and source_tier is not None:
+                by_tier.setdefault(source_tier, []).append(key)
+            elif result is LookupResult.HIT_PENDING:
+                inflight.append(key)
+            else:
+                # Missing, not converged, or promotions are held.
+                self._release_plan(req_id)
+                return None
+
+        if resident:
+            # Pin first: allocation may evict idle chunks. prepare_read avoids
+            # recording an access; prepare_load records it.
+            self.primary_tier.prepare_read(resident, req_context)
+            state.commit_pins.update(resident)
+
+        # Pin the keys the plan already reported too, for the same reason.
         self._pin_committed(state, keys)
+
+        if not self._promote_all(by_tier, state):
+            self._release_plan(req_id)
+            return None
+
+        # Another request's pending promotion is already on its way to host
+        # memory, which is all this request can observe.
+        state.plan_sources.update(
+            dict.fromkeys(resident + inflight, CacheHitSource.HOST)
+        )
         return {key: state.plan_sources[key] for key in keys}
 
     def _find_secondary_copy(
@@ -912,6 +968,48 @@ class TieringOffloadingManager(OffloadingManager):
         if any_retry:
             return _SecondaryCopy(None, LookupResult.RETRY)
         return None
+
+    def _cancel_promotions(self, req_id: str, keys: Collection[OffloadKey]) -> None:
+        """Withdraw queued (not yet submitted) promotions for `keys`.
+
+        A key another request's plan waits on stays: its promotion is still
+        wanted, just not by the request that queued it.
+        """
+        still_wanted = {
+            key
+            for state, wait_keys in self._plan_waiters(keys)
+            if state.req_context.req_id != req_id
+            for key in wait_keys
+        }
+        to_cancel = set(keys) - still_wanted
+        if not to_cancel:
+            return
+        for tier_idx, pending_by_ctx in list(self._pending_load_submissions.items()):
+            entry = pending_by_ctx.get(req_id)
+            if entry is None:
+                continue
+            kept_keys: list[OffloadKey] = []
+            kept_ids: list[int] = []
+            removed: list[OffloadKey] = []
+            for key, chunk_id in zip(entry.keys, entry.chunk_ids):
+                if key in to_cancel:
+                    removed.append(key)
+                else:
+                    kept_keys.append(key)
+                    kept_ids.append(chunk_id)
+            if not removed:
+                continue
+            self.primary_tier.complete_write(
+                tuple(removed), entry.req_context, success=False
+            )
+            # A plan that joined this promotion would otherwise wait forever.
+            self._fail_waiters(tuple(removed))
+            if kept_keys:
+                entry.keys, entry.chunk_ids = kept_keys, kept_ids
+            else:
+                del pending_by_ctx[req_id]
+                if not pending_by_ctx:
+                    del self._pending_load_submissions[tier_idx]
 
     def _queue_promotion(
         self,
@@ -952,6 +1050,40 @@ class TieringOffloadingManager(OffloadingManager):
             return LookupResult.RETRY, None
         return LookupResult.HIT_PENDING, copy.tier_idx
 
+    def _promote_all(
+        self, by_tier: dict[int, list[OffloadKey]], state: RequestState
+    ) -> bool:
+        """Allocate and queue one promotion per source tier.
+
+        Records the source tier for each promoted key. Returns False if any
+        allocation comes up short, after releasing everything it took.
+        """
+        req_context = state.req_context
+        allocated: list[tuple[int, list[OffloadKey], PrepareStoreOutput]] = []
+        for tier_idx, tier_keys in by_tier.items():
+            write = self.primary_tier.prepare_write(tier_keys, req_context)
+            if write is None or len(write.keys_to_store) != len(tier_keys):
+                self._metrics.on_promotion_allocation_failure()
+                if write is not None:
+                    self.primary_tier.complete_write(
+                        write.keys_to_store, req_context, success=False
+                    )
+                for _, _, done_write in allocated:
+                    self.primary_tier.complete_write(
+                        done_write.keys_to_store, req_context, success=False
+                    )
+                return False
+            allocated.append((tier_idx, tier_keys, write))
+
+        # Every tier allocated in full; only now queue the writes and record sources.
+        for tier_idx, tier_keys, write in allocated:
+            self._queue_promotion(tier_idx, write, req_context)
+            source = self.secondary_tiers[tier_idx].cache_hit_source
+            for key in tier_keys:
+                state.plan_sources[key] = source
+                state.failed_writes.discard(key)
+        return True
+
     def _pin_committed(self, state: RequestState, keys: Collection[OffloadKey]) -> None:
         """Pin recorded keys that are readable and not yet pinned."""
         req_context = state.req_context
@@ -966,6 +1098,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Internal housekeeping; prepare_load records the request access.
         self.primary_tier.prepare_read(fresh, req_context)
         state.commit_pins.update(fresh)
+        state.failed_writes.difference_update(fresh)
 
     def _unpin_committed(
         self, state: RequestState, keys: Collection[OffloadKey]
@@ -979,54 +1112,12 @@ class TieringOffloadingManager(OffloadingManager):
 
     def _release_plan(self, req_id: str) -> None:
         """Drop a request's committed plan, releasing everything it took."""
-        state = self._req_state.get(req_id)
-        if state is not None:
-            self._unpin_committed(state, list(state.commit_pins))
-            state.plan_sources.clear()
-
-    def _initiate_promotion(
-        self,
-        tier_idx: int,
-        key: OffloadKey,
-        req_context: ReqContext,
-    ) -> bool:
-        """Queue a chunk for promotion from a secondary tier to the primary tier.
-
-        Allocates space in the primary tier immediately (sets ref_cnt=-1 so
-        subsequent lookups within the same step see the slot as in-flight),
-        then defers the actual submit_load() call to _flush_pending_promotions()
-        so all chunks queued during one engine step are submitted as a single
-        batched job.
-
-        Args:
-            tier_idx: The secondary tier index to promote from
-            key: Chunk to promote
-            req_context: Per-request context forwarded to primary.prepare_write().
-
-        Returns:
-            True if promotion was initiated, False if primary tier is full.
-
-        """
-        # Allocate space in primary tier for promoted chunk.
-        # Must happen immediately so primary.lookup() returns None (in-flight)
-        # for this key on any subsequent lookup() call within the same step,
-        # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
-
-        if primary_write_result is None:
-            # Primary tier is full; caller should treat the chunk as unavailable
-            # rather than retrying indefinitely.
-            self._metrics.on_promotion_allocation_failure()
-            return False
-
-        state = self._req_state.get(req_context.req_id)
-        if state is not None:
-            source = self.secondary_tiers[tier_idx].cache_hit_source
-            for promoted_key in primary_write_result.keys_to_store:
-                state.plan_sources[promoted_key] = source
-        # Defer submit_load to on_schedule_end(), batched per (tier, request).
-        self._queue_promotion(tier_idx, primary_write_result, req_context)
-        return True
+        state = self._req_state[req_id]
+        self._unpin_committed(state, list(state.commit_pins))
+        # Every promotion a plan queues is recorded in sources, so this
+        # withdraws them all; an already-submitted one completes on its own.
+        self._cancel_promotions(req_id, list(state.plan_sources))
+        state.plan_sources.clear()
 
     def _forget_claims(
         self,
@@ -1062,11 +1153,19 @@ class TieringOffloadingManager(OffloadingManager):
         for state, wait_keys in self._plan_waiters(keys):
             self._pin_committed(state, wait_keys)
 
+    def _fail_waiters(self, keys: Collection[OffloadKey]) -> None:
+        """Break every committed plan waiting on `keys`."""
+        for state, wait_keys in self._plan_waiters(keys):
+            state.failed_writes.update(wait_keys)
+            for key in wait_keys:
+                state.plan_sources.pop(key, None)
+
     def _flush_pending_promotions(self) -> None:
         """Submit one batched submit_load() per (tier, request).
 
         Called from on_schedule_end() at the end of each scheduler step,
-        flushing all promotion requests deferred during lookup().
+        flushing all promotion requests deferred during commit_hits() and
+        claim_hits().
         """
         if not self._pending_load_submissions:
             return
@@ -1091,13 +1190,13 @@ class TieringOffloadingManager(OffloadingManager):
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> LoadStoreSpec:
-        """Prepare chunks to be loaded from primary tier to GPU.
+        """Prepare chunks to be loaded from primary tier to the device.
 
-        Callers only pass keys already confirmed HIT by lookup() earlier this
-        step.
-
-        This increments ref_cnt on the chunks in the primary tier, protecting
-        them from eviction during the transfer.
+        Runs once every committed key is readable and the request's device
+        blocks are allocated, so it is the first sign the committed set will
+        be read. Transfers the pins to the load and builds the spec; it never
+        allocates. If it never arrives, the commit is released at finish or
+        cache reset.
 
         Args:
             keys: Chunks to prepare for loading.
@@ -1112,11 +1211,12 @@ class TieringOffloadingManager(OffloadingManager):
             # The plan is issued; release the pins it holds.
             self._unpin_committed(state, list(state.commit_pins))
             state.plan_sources.clear()
+            state.failed_writes.clear()
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
-        """Mark chunks as done loading from primary tier to GPU.
+        """Mark chunks as done loading from primary tier to the device.
 
         This decrements ref_cnt on the chunks in the primary tier, allowing
         them to be evicted again.
@@ -1240,6 +1340,7 @@ class TieringOffloadingManager(OffloadingManager):
             tier = self.secondary_tiers[tier_idx]
             if not self._should_store_to_tier(tier, len(ready_keys)):
                 continue
+            # A cascade copies from the primary; it never promotes.
             claim = self._claim(ready_keys, req_context, tier_idx, promote=False)
             if claim.job is not None:
                 tier.submit_store(claim.job)
@@ -1292,8 +1393,11 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.complete_store(
             keys, req_context, trigger=trigger, success=success
         )
+        # Pin for committed waiters, or break their plans.
         if success:
             self._pin_for_waiters(keys)
+        else:
+            self._fail_waiters(keys)
 
         req_id = req_context.req_id
         state = self._req_state[req_id]
@@ -1305,6 +1409,7 @@ class TieringOffloadingManager(OffloadingManager):
                     continue
                 if not self._should_store_to_tier(tier, len(keys)):
                     continue
+                # A cascade copies from the primary; it never promotes.
                 claim = self._claim(keys, req_context, tier_idx, promote=False)
                 if claim.job is not None:
                     tier.submit_store(claim.job)
@@ -1515,10 +1620,10 @@ class TieringOffloadingManager(OffloadingManager):
             tier.on_schedule_end(context)
 
         for req_id in context.new_req_ids:
-            state = self._req_state.get(req_id)
-            if state is None:
+            new_state = self._req_state.get(req_id)
+            if new_state is None:
                 continue
-            self._metrics.on_request_allocated(state.req_context)
+            self._metrics.on_request_allocated(new_state.req_context)
 
         return StepResult(
             pending=self.has_pending_work(),
@@ -1595,9 +1700,8 @@ class TieringOffloadingManager(OffloadingManager):
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
-        for state in self._req_state.values():
-            state.plan_sources.clear()
-            state.commit_pins.clear()
+        # The primary tier is reset below, so these plans and claims die with
+        # it; do not try to release them individually.
         self._serve_claims.clear()
         self._metrics.assert_idle()
 
@@ -1605,6 +1709,9 @@ class TieringOffloadingManager(OffloadingManager):
         for req_id, state in self._req_state.items():
             state.pending_primary_stores = 0
             state.pending_cascade_keys.clear()
+            state.plan_sources.clear()
+            state.commit_pins.clear()
+            state.failed_writes.clear()
             if not state.is_finished:
                 continue
             for tier in self.secondary_tiers:

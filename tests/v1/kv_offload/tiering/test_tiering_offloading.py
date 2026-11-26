@@ -633,10 +633,11 @@ class TestTieringOffloadingManager:
 
         self.secondary_tier1.submit_load = submit_load  # type: ignore[method-assign]
 
-        # Lookup each chunk to initiate promotion for all of them
+        # Discovery reports the secondary copy as present, not readable.
         for chunk in chunks:
-            result = self.manager.lookup(chunk, _CTX)
-            assert result is LookupResult.HIT_PENDING  # promotion initiated
+            assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        sources = self.manager.commit_hits(chunks, _CTX)
+        assert sources == dict.fromkeys(chunks, source)
 
         # End of step 1: flushes deferred submit_load() calls
         self._simulate_on_schedule_end()
@@ -662,7 +663,7 @@ class TestTieringOffloadingManager:
         assert count_hits(self.manager, chunks) == 3
 
         # The request that caused the promotion retains the secondary origin.
-        assert self.manager.commit_hits(chunks, _CTX) == dict.fromkeys(chunks, source)
+        assert set(sources.values()) == {source}
 
         # A later request sees the chunks as ordinary host-memory primary hits.
         later_context = ReqContext(req_id="later")
@@ -671,9 +672,8 @@ class TestTieringOffloadingManager:
             self.manager.lookup(chunk, later_context) is LookupResult.HIT
             for chunk in chunks
         )
-        assert self.manager.commit_hits(chunks, later_context) == dict.fromkeys(
-            chunks, CacheHitSource.HOST
-        )
+        later_sources = self.manager.commit_hits(chunks, later_context)
+        assert later_sources == dict.fromkeys(chunks, CacheHitSource.HOST)
 
     @pytest.mark.parametrize(
         "source",
@@ -720,6 +720,7 @@ class TestTieringOffloadingManager:
 
         for chunk in chunks:
             assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.commit_hits(chunks, _CTX) is not None
 
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
@@ -765,6 +766,7 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_deferring)
         for chunk in chunks:
             assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.commit_hits(chunks, _CTX) is not None
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
         return events
@@ -932,6 +934,8 @@ class TestTieringOffloadingManager:
 
         # First lookup finds the chunk in a secondary tier and defers.
         assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        # The promotion starts only at the explicit commit.
+        assert self.manager.commit_hits([chunk], _CTX) is not None
 
         # Promotion is not treated as unresolved secondary lookup time.
         stats = self._simulate_on_schedule_end(new_req_ids=[_CTX.req_id]).stats
@@ -1196,6 +1200,7 @@ class TestTieringOffloadingManager:
 
         assert self.manager.lookup(chunks[0], _CTX) is LookupResult.HIT
         assert self.manager.lookup(chunks[1], _CTX) is LookupResult.MISS
+        assert self.manager.commit_hits(chunks, _CTX) is None
 
     def test_reset_holds_promotions_until_flushed(self, manager_setup):
         chunk = to_keys(range(1))[0]
@@ -1204,12 +1209,14 @@ class TestTieringOffloadingManager:
 
         self.manager.reset_cache()
         assert self.manager.lookup(chunk, _CTX) is LookupResult.MISS
+        assert self.manager.commit_hits([chunk], _CTX) is None
 
         self.manager.on_reset_flushed()
-        assert self.manager.lookup(chunk, _CTX) is not LookupResult.MISS
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
 
-    def test_lookup_batches_submit_load_per_request(self, manager_setup, monkeypatch):
-        """lookup() defers submit_load until on_schedule_end(), one per request.
+    def test_commit_batches_submit_load_per_request(self, manager_setup, monkeypatch):
+        """commit_hits() defers submit_load until on_schedule_end(), one per
+        request.
 
         Chunks from different requests each get their own submit_load call, each
         carrying the correct req_context.
@@ -1223,14 +1230,18 @@ class TestTieringOffloadingManager:
 
         ctx_a = ReqContext(req_id="req_a")
         ctx_b = ReqContext(req_id="req_b")
+        self._start_request(ctx_a)
+        self._start_request(ctx_b)
 
-        # All lookups return HIT_PENDING: secondary hit triggers promotion
-        assert self.manager.lookup(chunks[0], ctx_a) is LookupResult.HIT_PENDING
-        assert self.manager.lookup(chunks[1], ctx_a) is LookupResult.HIT_PENDING
-        assert self.manager.lookup(chunks[2], ctx_b) is LookupResult.HIT_PENDING
-        assert self.manager.lookup(chunks[3], ctx_b) is LookupResult.HIT_PENDING
+        # Discovery only: a secondary copy is present but not readable.
+        for chunk, ctx in zip(chunks, (ctx_a, ctx_a, ctx_b, ctx_b)):
+            assert self.manager.lookup(chunk, ctx) is LookupResult.HIT_PENDING
 
-        # submit_load must not fire during lookup - only at end of step
+        # submit_load must not fire during lookup or commit itself - only at
+        # the end of the step.
+        tier1_submit_load.assert_not_called()
+        assert self.manager.commit_hits(chunks[:2], ctx_a) is not None
+        assert self.manager.commit_hits(chunks[2:], ctx_b) is not None
         tier1_submit_load.assert_not_called()
 
         # simulate end of step
@@ -1248,11 +1259,11 @@ class TestTieringOffloadingManager:
     def test_lookup_shared_chunk_no_duplicate_promotion(
         self, manager_setup, monkeypatch
     ):
-        """A chunk looked up by two requests in the same step is promoted once.
+        """A chunk committed by two requests in the same step is promoted once.
 
-        The first lookup initiates promotion (returns None via secondary hit).
-        The second lookup sees ref_cnt=-1 on the primary slot and returns None
-        via the primary in-flight path — without triggering a second promotion.
+        The first commit allocates the primary slot and queues the promotion.
+        The second commit sees the primary slot as in flight and joins it
+        without triggering a second promotion.
         """
         shared_chunk = to_keys([0])[0]
         self.secondary_tier1.chunks[shared_chunk] = True
@@ -1262,14 +1273,15 @@ class TestTieringOffloadingManager:
 
         ctx_a = ReqContext(req_id="req_a")
         ctx_b = ReqContext(req_id="req_b")
+        self._start_request(ctx_a)
+        self._start_request(ctx_b)
 
-        result_a = self.manager.lookup(shared_chunk, ctx_a)
-        result_b = self.manager.lookup(shared_chunk, ctx_b)
+        # Both lookups discover the copy; neither promotes it.
+        assert self.manager.lookup(shared_chunk, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(shared_chunk, ctx_b) is LookupResult.HIT_PENDING
 
-        # Both lookups find the shared_chunk and trigger promotion
-        # returning HIT_PENDING.
-        assert result_a is LookupResult.HIT_PENDING
-        assert result_b is LookupResult.HIT_PENDING
+        assert self.manager.commit_hits([shared_chunk], ctx_a) is not None
+        assert self.manager.commit_hits([shared_chunk], ctx_b) is not None
 
         self._simulate_on_schedule_end()
 
@@ -1278,6 +1290,232 @@ class TestTieringOffloadingManager:
         job_metadata = tier1_submit_load.call_args.args[0]
         assert list(job_metadata.keys) == [shared_chunk]
         assert job_metadata.req_context is ctx_a
+
+    def test_lookup_does_not_allocate_or_promote(self, manager_setup, monkeypatch):
+        chunk = to_keys([7])[0]
+        self.secondary_tier1.chunks[chunk] = True
+        prepare_write = MagicMock(wraps=self.primary_tier.prepare_write)
+        monkeypatch.setattr(self.primary_tier, "prepare_write", prepare_write)
+        submit_load = MagicMock(wraps=self.secondary_tier1.submit_load)
+        monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_load)
+
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
+        prepare_write.assert_not_called()
+        assert self.manager._pending_load_submissions == {}
+        assert self.primary_tier._num_write_pending_chunks == 0
+
+        self._simulate_on_schedule_end()
+        submit_load.assert_not_called()
+
+    def test_commit_hits_pins_mixed_set_and_batches_promotion(
+        self, manager_setup, monkeypatch
+    ):
+        resident, secondary = to_keys([1, 2])
+        self._start_request()
+        self.manager.prepare_store([resident], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [resident], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.chunks[secondary] = True
+
+        submit_load = MagicMock(wraps=self.secondary_tier1.submit_load)
+        monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_load)
+
+        sources = self.manager.commit_hits([resident, secondary], _CTX)
+
+        assert sources == {
+            resident: CacheHitSource.HOST,
+            secondary: self.secondary_tier1.cache_hit_source,
+        }
+        resident_chunk = self.primary_tier._policy.get(resident)
+        assert resident_chunk is not None
+        assert resident_chunk.ref_cnt == 1
+        assert self.manager._req_state[_CTX.req_id].commit_pins == {resident}
+        # One batched promotion for the secondary copy, submitted at step end.
+        [(tier_idx, by_ctx)] = self.manager._pending_load_submissions.items()
+        assert tier_idx == 0
+        assert list(by_ctx[_CTX.req_id].keys) == [secondary]
+        submit_load.assert_not_called()
+
+        self._simulate_on_schedule_end()
+        submit_load.assert_called_once()
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(secondary, _CTX) is LookupResult.HIT
+
+        # prepare_load transfers the commit pin to the load and releases it.
+        spec = self.manager.prepare_load([resident, secondary], _CTX)
+        assert isinstance(spec, CPULoadStoreSpec)
+        assert resident_chunk.ref_cnt == 1
+        self.manager.complete_load([resident, secondary], _CTX)
+        assert resident_chunk.ref_cnt == 0
+
+    def test_commit_hits_failure_releases_everything(self, manager_setup):
+        """A set that cannot be fully allocated leaves the request prefilling."""
+        self._start_request()
+        # Occupy the whole pool with pending writes.
+        fill = to_keys(range(5))
+        assert self.primary_tier.prepare_write(fill, _CTX) is not None
+
+        chunk = to_keys([9])[0]
+        self.secondary_tier1.chunks[chunk] = True
+
+        assert self.manager.commit_hits([chunk], _CTX) is None
+        assert self.manager._pending_load_submissions == {}
+        state = self.manager._req_state[_CTX.req_id]
+        assert not state.plan_sources and not state.commit_pins
+        assert self.primary_tier._num_write_pending_chunks == 5
+
+    def test_commit_hits_recommit_does_not_double_pin(self, manager_setup):
+        chunk = to_keys([3])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+
+        first = self.manager.commit_hits([chunk], _CTX)
+        second = self.manager.commit_hits([chunk], _CTX)
+
+        assert first == second == {chunk: CacheHitSource.HOST}
+        chunk_state = self.primary_tier._policy.get(chunk)
+        assert chunk_state is not None
+        assert chunk_state.ref_cnt == 1
+
+    def test_prepare_load_transfers_commit_pins(self, manager_setup):
+        chunk = to_keys([4])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        chunk_state = self.primary_tier._policy.get(chunk)
+        assert chunk_state is not None
+        assert chunk_state.ref_cnt == 1
+
+        spec = self.manager.prepare_load([chunk], _CTX)
+        assert isinstance(spec, CPULoadStoreSpec)
+        assert chunk_state.ref_cnt == 1
+        self.manager.complete_load([chunk], _CTX)
+        assert chunk_state.ref_cnt == 0
+
+    def test_failed_promotion_breaks_the_committed_plan(
+        self, manager_setup, monkeypatch
+    ):
+        chunk = to_keys([6])[0]
+        self._start_request()
+        self.secondary_tier1.chunks[chunk] = True
+
+        def submit_failing(job_metadata: TransferJob) -> None:
+            self.secondary_tier1.completed_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+
+        monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_failing)
+
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        # The copy's promotion failed: the plan cannot become readable, so
+        # the request must recompute rather than defer forever.
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.MISS
+
+    def test_refused_commit_does_not_repromote_a_failed_key(
+        self, manager_setup, monkeypatch
+    ):
+        """An unschedulable request re-plans every step; a key whose promotion
+        failed must stay a miss instead of being promoted again each time."""
+        chunk = to_keys([6])[0]
+        self._start_request()
+        self.secondary_tier1.chunks[chunk] = True
+        submitted: list[TransferJob] = []
+
+        def submit_failing(job_metadata: TransferJob) -> None:
+            submitted.append(job_metadata)
+            self.secondary_tier1.completed_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+
+        monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_failing)
+
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is None
+
+        for _ in range(2):
+            assert self.manager.lookup(chunk, _CTX) is LookupResult.MISS
+            assert self.manager.commit_hits([chunk], _CTX) is None
+            self._simulate_on_schedule_end()
+        assert len(submitted) == 1
+
+    def test_failed_key_is_committable_once_resident(self, manager_setup, monkeypatch):
+        """A failed promotion does not block the key once it is resident."""
+        chunk = to_keys([7])[0]
+        self._start_request()
+        self.secondary_tier1.chunks[chunk] = True
+
+        def submit_failing(job_metadata: TransferJob) -> None:
+            self.secondary_tier1.completed_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+
+        monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_failing)
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is None
+
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+
+    def test_commit_pins_residents_before_allocating_promotions(self, manager_setup):
+        """A promotion may evict idle chunks, but never a resident this
+        commit is about to pin."""
+        resident, secondary = to_keys([1, 2])
+        self._start_request()
+        # Fill the five-chunk primary tier; `resident` is the oldest entry.
+        for key in [resident, *to_keys(range(10, 14))]:
+            assert self.primary_tier.prepare_write([key], _CTX) is not None
+            self.primary_tier.complete_write([key], _CTX, success=True)
+        assert self.primary_tier._get_num_free_chunks() == 0
+        self.secondary_tier1.chunks[secondary] = True
+
+        sources = self.manager.commit_hits([resident, secondary], _CTX)
+
+        assert sources is not None
+        assert self.primary_tier.lookup(resident, _CTX) is LookupResult.HIT
+        assert resident in self.manager._req_state[_CTX.req_id].commit_pins
+        resident_chunk = self.primary_tier._policy.get(resident)
+        assert resident_chunk is not None
+        assert resident_chunk.ref_cnt == 1
+
+    def test_commit_hits_reports_the_plan_sources(self, manager_setup):
+        resident, secondary = to_keys([30, 31])
+        self._start_request()
+        self.manager.prepare_store([resident], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [resident], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.chunks[secondary] = True
+
+        sources = self.manager.commit_hits([resident, secondary], _CTX)
+
+        assert sources == {
+            resident: CacheHitSource.HOST,
+            secondary: self.secondary_tier1.cache_hit_source,
+        }
 
     def test_commit_accepts_residents_while_promotions_held(self, manager_setup):
         resident, secondary = to_keys([45, 46])
@@ -1352,6 +1590,30 @@ class TestTieringOffloadingManager:
         )
         assert state.commit_pins == set()
 
+    def test_commit_repromotes_an_evicted_key(self, manager_setup):
+        chunk = to_keys([48])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(), preempted_req_ids=(), live_plan_req_ids=set()
+            )
+        )
+
+        # Evict the key by filling the primary tier.
+        for key in to_keys(range(60, 65)):
+            assert self.primary_tier.prepare_write([key], _CTX) is not None
+            self.primary_tier.complete_write([key], _CTX, success=True)
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.MISS
+
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
     def test_finished_request_releases_its_commit_pins(self, manager_setup):
         """A plan that never reaches prepare_load (an aborted request, say)
         gives its commit pins back when the request finishes."""
@@ -1379,8 +1641,6 @@ class TestTieringOffloadingManager:
         assert self.primary_tier.prepare_write([resident], _CTX) is not None
         self.primary_tier.complete_write([resident], _CTX, success=True)
         self.secondary_tier1.chunks[secondary] = True
-        # The walk promotes the secondary copy; the commit reserves both.
-        assert self.manager.lookup(secondary, _CTX) is LookupResult.HIT_PENDING
         assert self.manager.commit_hits([resident, secondary], _CTX) is not None
         state = self.manager._req_state[_CTX.req_id]
         assert state.commit_pins == {resident}
@@ -1403,6 +1663,42 @@ class TestTieringOffloadingManager:
             )
         )
         assert state.commit_pins == set()
+
+    def test_commit_never_evicts_a_key_it_reports(self, manager_setup):
+        """Pinning the plan's readable keys before allocating a promotion keeps
+        a commit from reporting a key its own allocation evicted."""
+        stale, readable = to_keys([46, 45])
+        self._start_request()
+        for key in (stale, readable):
+            self.manager.prepare_store([key], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+            self.manager.complete_store(
+                [key], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+            )
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([stale, readable], _CTX) == {
+            stale: CacheHitSource.HOST,
+            readable: CacheHitSource.HOST,
+        }
+
+        # Not scheduled this step: the plan's pins are released.
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(), preempted_req_ids=(), live_plan_req_ids=set()
+            )
+        )
+        # Fill the pool; the oldest chunk, `stale`, is evicted.
+        fillers = to_keys(range(5, 9))
+        for key in fillers:
+            assert self.primary_tier.prepare_write([key], _CTX) is not None
+            self.primary_tier.complete_write([key], _CTX, success=True)
+        assert self.primary_tier.lookup(stale, _CTX) is LookupResult.MISS
+        assert self.primary_tier.lookup(readable, _CTX) is LookupResult.HIT
+
+        # Pin everything but `readable`: repairing `stale` would have to evict
+        # it, so the commit is refused instead.
+        self.primary_tier.prepare_read(fillers, _CTX)
+        assert self.manager.commit_hits([stale, readable], _CTX) is None
+        assert self.primary_tier.lookup(readable, _CTX) is LookupResult.HIT
 
     def test_claim_serves_residents_while_promotions_held(self, manager_setup):
         resident, secondary = to_keys([40, 41])
@@ -1450,33 +1746,80 @@ class TestTieringOffloadingManager:
         assert claim.missing_keys == [chunk]
         prepare_write.assert_not_called()
 
-    def test_claim_promotes_a_key_after_its_promotion_failed(
+    def test_reclaim_releases_queued_promotions_for_dropped_keys(self, manager_setup):
+        dropped, kept = to_keys([50, 51])
+        self._start_request()
+        self.secondary_tier1.chunks[dropped] = True
+        self.secondary_tier1.chunks[kept] = True
+
+        assert self.manager.commit_hits([dropped, kept], _CTX) is not None
+        assert self.manager.commit_hits([kept], _CTX) is not None
+
+        [(_, by_ctx)] = self.manager._pending_load_submissions.items()
+        assert list(by_ctx[_CTX.req_id].keys) == [kept]
+        assert self.primary_tier.lookup(dropped, _CTX) is LookupResult.MISS
+
+    def test_withdrawn_promotion_stays_for_a_joined_plan(self, manager_setup):
+        chunk = to_keys([44])[0]
+        owner = ReqContext(req_id="owner")
+        joiner = ReqContext(req_id="joiner")
+        self._start_request(owner)
+        self._start_request(joiner)
+        self.secondary_tier2.chunks[chunk] = True
+
+        assert self.manager.commit_hits([chunk], owner) is not None
+        # The joiner sees the promotion in flight and records it.
+        assert self.manager.commit_hits([chunk], joiner) is not None
+
+        # The owner withdraws its plan before the promotion is submitted; the
+        # promotion stays because the joiner's plan still waits on it.
+        assert self.manager.commit_hits((), owner) is None
+        assert self.manager._pending_load_submissions
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(chunk, joiner) is LookupResult.HIT
+        assert chunk in self.manager._req_state[joiner.req_id].commit_pins
+
+    def test_promoted_chunk_is_pinned_for_the_planner(self, manager_setup):
+        chunk = to_keys([20])[0]
+        self._start_request()
+        self.secondary_tier1.chunks[chunk] = True
+
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT
+        assert chunk in self.manager._req_state[_CTX.req_id].commit_pins
+        promoted = self.primary_tier._policy.get(chunk)
+        assert promoted is not None
+        assert promoted.ref_cnt == 1
+
+    def test_failed_shared_promotion_breaks_every_committed_plan(
         self, manager_setup, monkeypatch
     ):
-        """A failed promotion frees the primary chunk but not the copy; a later
-        claim is what starts the retry."""
-        from vllm.v1.kv_offload.tiering.base import JobResult
-
-        chunk = to_keys([44])[0]
-        # _claim excludes the claiming tier; use the second secondary tier.
-        self.secondary_tier2.chunks[chunk] = True
+        chunk = to_keys([21])[0]
+        joiner = ReqContext(req_id="joiner")
         self._start_request()
+        self._start_request(joiner)
+        self.secondary_tier1.chunks[chunk] = True
 
-        def submit_failing(job_metadata):
-            self.secondary_tier2.completed_jobs.append(
+        def submit_failing(job_metadata: TransferJob) -> None:
+            self.secondary_tier1.completed_jobs.append(
                 JobResult(job_id=job_metadata.job_id, success=False)
             )
 
-        monkeypatch.setattr(self.secondary_tier2, "submit_load", submit_failing)
-        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        monkeypatch.setattr(self.secondary_tier1, "submit_load", submit_failing)
+
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        # The second request joins the promotion already in flight.
+        assert self.manager.commit_hits([chunk], joiner) is not None
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
-        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.MISS
 
-        claim = self.manager._claim([chunk], _CTX)
-
-        assert claim.pending_keys == [chunk]
-        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.MISS
+        assert self.manager.lookup(chunk, joiner) is LookupResult.MISS
 
     def test_complete_store_forwards_req_context_to_submit_store(
         self, manager_setup, monkeypatch
@@ -1957,10 +2300,10 @@ class TestTieringOffloadingManager:
         # the lookup that staged it).
         promo_chunk = to_keys([99])[0]
         self.secondary_tier1.chunks[promo_chunk] = True
-        assert (
-            self.manager.lookup(promo_chunk, ReqContext(req_id="pending"))
-            is LookupResult.HIT_PENDING
-        )
+        pending_ctx = ReqContext(req_id="pending")
+        self._start_request(pending_ctx)
+        assert self.manager.lookup(promo_chunk, pending_ctx) is LookupResult.HIT_PENDING
+        assert self.manager.commit_hits([promo_chunk], pending_ctx) is not None
         assert self.manager._pending_load_submissions
 
         # Request-level tier registration.
@@ -1988,7 +2331,11 @@ class TestTieringOffloadingManager:
         assert self.manager._jobs == {}
         assert self.manager._pending_load_submissions == {}
         assert not any(state.plan_sources for state in self.manager._req_state.values())
-        assert set(self.manager._req_state) == {_CTX.req_id, rl_ctx.req_id}
+        assert set(self.manager._req_state) == {
+            _CTX.req_id,
+            rl_ctx.req_id,
+            pending_ctx.req_id,
+        }
         assert self.manager._processed_jobs_this_step is False
 
         # Primary tier reset to a fresh state.
@@ -2080,64 +2427,6 @@ class TestTieringOffloadingManager:
         ctx = ReqContext(req_id="r2", load_tier_filter=load_tier_filter)
         assert self.manager.lookup(chunks[0], ctx) is LookupResult.HIT_PENDING
         tier1_lookup.assert_called()
-
-    def test_commit_hits_reports_the_recorded_provenance(self, manager_setup):
-        resident, secondary = to_keys([30, 31])
-        self._start_request()
-        self.manager.prepare_store([resident], _CTX, trigger=StoreTrigger.ON_COMPUTE)
-        self.manager.complete_store(
-            [resident], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
-        )
-        self._simulate_on_schedule_end()
-        self.secondary_tier1.chunks[secondary] = True
-        # The walk promotes the secondary copy and records its origin.
-        assert self.manager.lookup(secondary, _CTX) is LookupResult.HIT_PENDING
-
-        sources = self.manager.commit_hits([resident, secondary], _CTX)
-
-        assert sources == {
-            resident: CacheHitSource.HOST,
-            secondary: self.secondary_tier1.cache_hit_source,
-        }
-
-    def test_commit_hits_refuses_the_set_when_a_key_is_missing(self, manager_setup):
-        resident, missing = to_keys([32, 33])
-        self._start_request()
-        self.manager.prepare_store([resident], _CTX, trigger=StoreTrigger.ON_COMPUTE)
-        self.manager.complete_store(
-            [resident], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
-        )
-        self._simulate_on_schedule_end()
-
-        assert self.manager.commit_hits([resident, missing], _CTX) is None
-        assert self.manager._req_state[_CTX.req_id].plan_sources == {}
-
-    def test_commit_hits_empty_set_releases_the_plan(self, manager_setup):
-        chunk = to_keys([34])[0]
-        self._start_request()
-        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
-        self.manager.complete_store(
-            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
-        )
-        self._simulate_on_schedule_end()
-        assert self.manager.commit_hits([chunk], _CTX) is not None
-
-        assert self.manager.commit_hits((), _CTX) is None
-        assert self.manager._req_state[_CTX.req_id].plan_sources == {}
-
-    def test_commit_hits_repeat_reconciles_the_plan(self, manager_setup):
-        kept, dropped = to_keys([35, 36])
-        self._start_request()
-        for key in (kept, dropped):
-            self.manager.prepare_store([key], _CTX, trigger=StoreTrigger.ON_COMPUTE)
-            self.manager.complete_store(
-                [key], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
-            )
-        self._simulate_on_schedule_end()
-
-        assert self.manager.commit_hits([kept, dropped], _CTX) is not None
-        assert self.manager.commit_hits([kept], _CTX) == {kept: CacheHitSource.HOST}
-        assert set(self.manager._req_state[_CTX.req_id].plan_sources) == {kept}
 
     def test_repeat_commit_refuses_an_evicted_recorded_key(self, manager_setup):
         """A key the plan recorded but that was evicted while the request
