@@ -1279,6 +1279,131 @@ class TestTieringOffloadingManager:
         assert list(job_metadata.keys) == [shared_chunk]
         assert job_metadata.req_context is ctx_a
 
+    def test_commit_accepts_residents_while_promotions_held(self, manager_setup):
+        resident, secondary = to_keys([45, 46])
+        self._start_request()
+        assert self.primary_tier.prepare_write([resident], _CTX) is not None
+        self.primary_tier.complete_write([resident], _CTX, success=True)
+        self.secondary_tier1.chunks[secondary] = True
+        self.manager._promotions_held = True
+
+        sources = self.manager.commit_hits([resident], _CTX)
+
+        assert sources == {resident: CacheHitSource.HOST}
+        assert resident in self.manager._req_state[_CTX.req_id].commit_pins
+        assert self.manager.commit_hits([secondary], _CTX) is None
+
+    def test_recommit_repins_readable_keys(self, manager_setup):
+        chunk = to_keys([47])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+
+        state = self.manager._req_state[_CTX.req_id]
+        chunk_state = self.primary_tier._policy.get(chunk)
+        assert chunk_state is not None
+        assert state.commit_pins == {chunk}
+        assert chunk_state.ref_cnt == 1
+
+        # Not scheduled this step: the end-of-step hook releases the pins.
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(), preempted_req_ids=(), live_plan_req_ids=set()
+            )
+        )
+        assert state.commit_pins == set()
+        assert chunk in state.plan_sources
+        assert chunk_state.ref_cnt == 0
+
+        # A repeat commit re-pins the readable key.
+        sources = self.manager.commit_hits([chunk], _CTX)
+        assert sources == {chunk: CacheHitSource.HOST}
+        assert state.commit_pins == {chunk}
+        assert chunk_state.ref_cnt == 1
+
+    def test_on_schedule_end_keeps_pins_for_live_plans(self, manager_setup):
+        chunk = to_keys([49])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        state = self.manager._req_state[_CTX.req_id]
+
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(),
+                preempted_req_ids=(),
+                live_plan_req_ids={_CTX.req_id},
+            )
+        )
+        assert state.commit_pins == {chunk}
+
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(), preempted_req_ids=(), live_plan_req_ids=set()
+            )
+        )
+        assert state.commit_pins == set()
+
+    def test_finished_request_releases_its_commit_pins(self, manager_setup):
+        """A plan that never reaches prepare_load (an aborted request, say)
+        gives its commit pins back when the request finishes."""
+        chunk = to_keys([50])[0]
+        self._start_request()
+        self.manager.prepare_store([chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE)
+        self.manager.complete_store(
+            [chunk], _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
+        )
+        self._simulate_on_schedule_end()
+        assert self.manager.commit_hits([chunk], _CTX) is not None
+        chunk_state = self.primary_tier._policy.get(chunk)
+        assert chunk_state is not None
+        assert chunk_state.ref_cnt == 1
+
+        self.manager.on_request_finished(_CTX)
+
+        assert chunk_state.ref_cnt == 0
+
+    def test_unscheduled_plan_keeps_pins_while_promoting(self, manager_setup):
+        """A plan waiting on its own promotion keeps its resident pins, so the
+        promotion's neighbours are not evicted and re-promoted every step."""
+        resident, secondary = to_keys([42, 43])
+        self._start_request()
+        assert self.primary_tier.prepare_write([resident], _CTX) is not None
+        self.primary_tier.complete_write([resident], _CTX, success=True)
+        self.secondary_tier1.chunks[secondary] = True
+        # The walk promotes the secondary copy; the commit reserves both.
+        assert self.manager.lookup(secondary, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.commit_hits([resident, secondary], _CTX) is not None
+        state = self.manager._req_state[_CTX.req_id]
+        assert state.commit_pins == {resident}
+
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(), preempted_req_ids=(), live_plan_req_ids=set()
+            )
+        )
+        assert state.commit_pins == {resident}
+
+        # Once the promotion lands and nothing is queued or in flight, the
+        # pins go as usual.
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(secondary, _CTX) is LookupResult.HIT
+        self.manager.on_schedule_end(
+            ScheduleEndContext(
+                new_req_ids=(), preempted_req_ids=(), live_plan_req_ids=set()
+            )
+        )
+        assert state.commit_pins == set()
+
     def test_complete_store_forwards_req_context_to_submit_store(
         self, manager_setup, monkeypatch
     ):
