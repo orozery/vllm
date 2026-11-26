@@ -84,6 +84,11 @@ class _LookupProbe:
 
     # Keys the walk saw readable.
     ready_keys: set[OffloadKey] = field(default_factory=set)
+    # Leading readable chunks of the last full-attention scan.
+    confirmed_prefix: int = 0
+    # Readable tokens of the full-attention prefix. The tail search may extend
+    # past it, but the shared-prefix junction may not.
+    confirmed_fa_boundary: int | None = None
 
 
 def _parse_tier_filter(raw: Any) -> TierFilter:
@@ -492,27 +497,40 @@ class OffloadingConnectorScheduler:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
         hit_count = 0
+        # Leading readable hits; a pending key does not confirm the junction.
+        confirmed_count = 0
+        confirming = True
         defer_lookup = False
         for local_idx, key in enumerate(keys):
             result = self.manager.lookup(key, req_context)
             match result:
                 case LookupResult.HIT | LookupResult.HIT_PENDING:
+                    # HIT_PENDING is present, just not readable yet. It counts
+                    # as a hit: the commit below starts its promotion, and the
+                    # request defers until the committed set is readable.
                     self._events_tracker.record_lookup(
                         req,
                         group_config,
                         start_chunk_idx + local_idx,
                         key,
                     )
-                    if result is LookupResult.HIT and probe is not None:
-                        probe.ready_keys.add(key)
+                    if result is LookupResult.HIT_PENDING:
+                        confirming = False
+                    else:
+                        if probe is not None:
+                            probe.ready_keys.add(key)
+                        if confirming:
+                            confirmed_count += 1
                     hit_count += 1
-                    defer_lookup |= result is LookupResult.HIT_PENDING
                 case LookupResult.RETRY:
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups (until a miss is detected).
+                    # Not converged. Don't break: keep scanning to let the
+                    # manager kick off async lookups (until a miss is seen).
+                    confirming = False
                     defer_lookup = True
                 case LookupResult.MISS:
                     break
+        if probe is not None:
+            probe.confirmed_prefix = confirmed_count
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -526,9 +544,8 @@ class OffloadingConnectorScheduler:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
         The first run may need a larger window for a partial rightmost chunk.
-        Returns 0 on miss, None if the backend deferred a lookup."""
+        Returns 0 on miss, None if a lookup has not converged."""
         defer_lookup = False
-        pending_in_window = False
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
         for idx in range(len(keys) - 1, -1, -1):
@@ -538,29 +555,24 @@ class OffloadingConnectorScheduler:
                         probe.ready_keys.add(keys[idx])
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
-                    # Block is in cache, just not readable yet — counts
-                    # as hit for the consecutive streak. Don't break:
-                    # keep scanning to let manager kick off async lookups.
-                    pending_in_window = True
+                    # Present, just not readable yet; it counts as a hit and
+                    # the commit promotes it. Don't break: keep scanning to
+                    # let the manager kick off async lookups.
                     consecutive_hits += 1
                 case LookupResult.RETRY:
-                    # Block location uncertain — does not count as hit.
+                    # Lookup has not converged — does not count as hit.
                     # Don't break: keep scanning to let manager kick off
                     # async lookups.
                     defer_lookup = True
                     consecutive_hits = 0
-                    pending_in_window = False
                     required_window = sliding_window_size
                 case LookupResult.MISS:
                     consecutive_hits = 0
                     # This gap rules out the incomplete window to its right.
-                    pending_in_window = False
                     required_window = sliding_window_size
             if consecutive_hits == required_window:
-                return (
-                    None if defer_lookup or pending_in_window else idx + required_window
-                )
-        return None if defer_lookup or pending_in_window else consecutive_hits
+                return None if defer_lookup else idx + required_window
+        return None if defer_lookup else consecutive_hits
 
     def _lookup_complete_chunks(
         self,
@@ -609,6 +621,8 @@ class OffloadingConnectorScheduler:
             state.lookup_hit_end_chunk_idx = 0
 
         full_attention_hit_boundary: int | None = None
+        # A pending chunk must not extend the shared-prefix junction.
+        confirmed_fa_boundary: int | None = None
         while lookup_groups:
             looked_up_sliding_window: bool = False
             full_attention_deferred = False
@@ -680,6 +694,21 @@ class OffloadingConnectorScheduler:
                     group_state.lookup_hit_end_chunk_idx = start_chunk_idx + (
                         num_hit_chunks or 0
                     )
+                    confirmed_prefix = (
+                        probe.confirmed_prefix
+                        if probe is not None
+                        else (num_hit_chunks or 0)
+                    )
+                    confirmed_chunks = start_chunk_idx + confirmed_prefix
+                    confirmed_tokens = tokens_per_chunk * confirmed_chunks
+                    if confirmed_fa_boundary is None:
+                        confirmed_fa_boundary = confirmed_tokens
+                    else:
+                        confirmed_fa_boundary = min(
+                            confirmed_fa_boundary, confirmed_tokens
+                        )
+                    if probe is not None:
+                        probe.confirmed_fa_boundary = confirmed_fa_boundary
                 else:
                     required_window = sliding_window_size_in_chunks
                     candidate_end = min(
@@ -787,9 +816,14 @@ class OffloadingConnectorScheduler:
             max_num_new_tokens,
             probe,
         )
-        if num_hit_tokens is not None and full_attention_hit_boundary is not None:
+        # The tail search may look past the readable prefix; the junction may
+        # not, since a pending chunk would pin state the recompute lacks.
+        junction_boundary = probe.confirmed_fa_boundary
+        if junction_boundary is None:
+            junction_boundary = full_attention_hit_boundary
+        if num_hit_tokens is not None and junction_boundary is not None:
             self._maybe_register_shared_prefix_junction(
-                req_status, full_attention_hit_boundary, num_hit_tokens
+                req_status, junction_boundary, num_hit_tokens
             )
         return num_hit_tokens
 
@@ -870,7 +904,9 @@ class OffloadingConnectorScheduler:
                 if result is LookupResult.MISS:
                     max_boundary = bridge_boundary - tokens_per_hash
                     break
-                pending |= result is not LookupResult.HIT
+                if result is LookupResult.HIT and probe is not None:
+                    probe.ready_keys.add(key)
+                pending |= result is LookupResult.RETRY
         bridge_pending = pending
         # A tail of this request may lie below a sibling's longer full-attention
         # prefix. A block-aligned boundary there is a complete chunk, which the
@@ -908,9 +944,10 @@ class OffloadingConnectorScheduler:
 
         `bridge_pending` is True if a complete chunk that the hit also loads
         is not ready yet.
-        Returns `(hit, pending)`. `hit` is True only if every key is ready.
-        `pending` is True if no required key missed and a required key or
-        bridge chunk is not ready yet.
+        Returns `(hit, pending)`. `hit` is True if no required key missed; a
+        key that is present but not readable yet counts as a hit, and the
+        commit promotes it. `pending` is True if no required key missed and a
+        required key or bridge chunk is not ready yet.
         """
         req = req_status.req
         req_context = req_status.req_context
@@ -925,9 +962,12 @@ class OffloadingConnectorScheduler:
             result = self.manager.lookup(key, req_context)
             if result is LookupResult.MISS:
                 return False, False
+            # HIT_PENDING is present and gets promoted by the commit; only an
+            # unconverged lookup or another request's in-flight load means
+            # "wait for more information".
             if result is LookupResult.HIT and probe is not None:
                 probe.ready_keys.add(key)
-            pending |= result is not LookupResult.HIT
+            pending |= result is LookupResult.RETRY
             boundary_keys.append((group_config, key))
 
         if pending:
