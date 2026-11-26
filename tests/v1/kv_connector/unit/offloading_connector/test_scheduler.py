@@ -2177,6 +2177,44 @@ def test_partial_lookup_defers_only_for_viable_pending_boundary(
 
 
 @pytest.mark.cpu_test
+def test_committed_plan_is_rechecked_without_rewalking():
+    """A deferred plan re-checks only its keys; a changed input re-plans."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+    walks = 0
+
+    def walk(req_status, max_new=None, probe=None):
+        nonlocal walks
+        walks += 1
+        return 10
+
+    scheduler._lookup = walk
+
+    # Commit, but the set is not readable yet: defer without re-walking.
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.HIT_PENDING
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert walks == 1
+    assert scheduler._req_status["req"].committed_plan
+
+    # Same inputs and now readable: report the committed result, no re-walk.
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (10, True)
+    assert walks == 1
+
+    # A changed token cap invalidates the plan and re-walks.
+    assert scheduler.get_num_new_matched_tokens(request, 0, max_num_new_tokens=4) == (
+        10,
+        True,
+    )
+    assert walks == 2
+    scheduler.manager.commit_hits.assert_any_call(
+        (), scheduler._req_status["req"].req_context
+    )
+
+
+@pytest.mark.cpu_test
 def test_deferred_load_keeps_its_plan_live():
     """An accepted async load whose callback the core defers keeps its plan
     live, so the end-of-step hook does not release the pins it will rely on."""
@@ -2184,11 +2222,8 @@ def test_deferred_load_keeps_its_plan_live():
     request, req_status = _make_anchored_partial_tail_request(
         scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
     )
-    scheduler.manager.commit_hits.return_value = {
-        make_offload_key(b"h3", 0): CacheHitSource.HOST
-    }
     assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
-    assert req_status.load_sources
+    assert req_status.committed_plan is not None
     output = MagicMock()
     output.num_scheduled_tokens = {}
 
@@ -2226,6 +2261,60 @@ def test_unconverged_lookup_defers_before_commit():
 
 
 @pytest.mark.cpu_test
+def test_committed_plan_defers_while_a_key_is_loading():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    scheduler._chunks_being_loaded = set(plan.keys)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+
+
+@pytest.mark.cpu_test
+def test_ready_plan_recommits_to_repin():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    manager = scheduler.manager
+
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    _as_mock(manager.commit_hits).reset_mock()
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    _as_mock(manager.commit_hits).assert_called_once_with(
+        plan.keys, req_status.req_context
+    )
+
+
+@pytest.mark.cpu_test
+def test_committed_plan_repairs_an_evicted_key():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    manager = scheduler.manager
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    manager.lookup.side_effect = None
+    manager.lookup.return_value = LookupResult.MISS
+    manager.commit_hits.reset_mock()
+    manager.commit_hits.return_value = dict.fromkeys(plan.keys, CacheHitSource.HOST)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    manager.commit_hits.assert_called_once_with(plan.keys, req_status.req_context)
+    assert req_status.committed_plan is plan
+
+
+@pytest.mark.cpu_test
 def test_no_commit_when_lookup_finds_no_hits():
     """A request with no hits must not reach the manager's commit."""
     scheduler = _make_partial_tail_scheduler()
@@ -2249,6 +2338,7 @@ def test_zero_external_tokens_releases_plan_without_prepare_load():
     commit_hits = scheduler.manager.commit_hits
 
     assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.committed_plan is not None
     commit_hits.reset_mock()
     prepare_load.reset_mock()
 
@@ -2257,7 +2347,7 @@ def test_zero_external_tokens_releases_plan_without_prepare_load():
 
     commit_hits.assert_called_once_with((), req_status.req_context)
     prepare_load.assert_not_called()
-    assert req_status.load_sources == {}
+    assert req_status.committed_plan is None
 
 
 @pytest.mark.cpu_test

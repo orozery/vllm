@@ -260,6 +260,26 @@ class RequestGroupState:
     lookup_hit_end_chunk_idx: int = 0
 
 
+class LoadPlanInputs(NamedTuple):
+    """The inputs a committed load plan was computed from."""
+
+    local_prefix_tokens: int
+    max_load_tokens: int | None
+    max_num_new_tokens: int | None
+    # Last key per group; detects a rebuilt token sequence of equal length.
+    group_tail_keys: tuple[OffloadKey, ...]
+
+
+class CommittedLoadPlan(NamedTuple):
+    """A request's committed load, reported once its keys are readable."""
+
+    # Every key the load will read.
+    keys: tuple[OffloadKey, ...]
+    num_hit_tokens: int
+    partial_tail_boundary: int | None
+    inputs: LoadPlanInputs
+
+
 @dataclass(slots=True)
 class RequestOffloadState:
     config: SchedulerOffloadConfig
@@ -290,9 +310,14 @@ class RequestOffloadState:
     # A load for this request failed; all its later lookups, including after
     # preemption, skip the offloaded cache so a faulting load is not retried.
     load_failed: bool = False
-    # Sources returned by the commit, kept for
+    # Kept until its keys are readable; consumed by update_state_after_alloc().
+    committed_plan: CommittedLoadPlan | None = None
+    # Sources returned by the commit, kept past plan consumption for
     # get_external_cache_hit_sources().
     load_sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
+
+    def clear_plan(self) -> None:
+        self.committed_plan = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
