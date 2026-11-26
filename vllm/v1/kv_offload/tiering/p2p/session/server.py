@@ -33,7 +33,7 @@ from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.kv_offload.tiering.base import JobId, ParentManager
+    from vllm.v1.kv_offload.tiering.base import JobId, ParentManager, TransferJob
     from vllm.v1.kv_offload.tiering.p2p.data import DataTransport
 
 logger = init_logger(__name__)
@@ -203,6 +203,9 @@ class _ActiveLookup:
     # Keys still awaiting resolution (HIT_PENDING / RETRY from
     # ``parent.lookup``); re-polled by ``_resolve_pending_lookups``.
     pending: set[OffloadKey] = field(default_factory=set)
+    # HIT_PENDING keys claimed during the current serve. Cleared before each
+    # serve, so a failed promotion is retried on the next poll.
+    claimed: set[OffloadKey] = field(default_factory=set)
     # Absolute deadline (``time.monotonic``). Once reached, remaining
     # ``pending`` keys are force-resolved to MISS so the consumer
     # can fall back instead of waiting on a stuck producer.
@@ -494,6 +497,9 @@ class ServerRole:
             if st is None:
                 self._serve_pending.discard(kv_request_id)
                 continue
+            # One claim per pending key per serve; a later serve retries it.
+            for lookup in st.lookups.values():
+                lookup.claimed.clear()
             if st.pending_lookups:
                 pending = st.pending_lookups
                 st.pending_lookups = []
@@ -524,20 +530,21 @@ class ServerRole:
         `parent.lookup` and record the outcome on `lookup`: HIT / MISS
         land in `resolved` and clear `pending`; HIT_PENDING / RETRY park
         in `pending` for a later serve. Newly-HIT keys are pinned in one
-        batch via `_pin_and_register_hits` and also returned (for
-        caller logging).
+        batch via `_register_claim` and also returned (for caller logging).
 
         Shared by the first-sighting pass (`_process_inbound_lookup`)
         and the re-poll pass (`_resolve_pending_lookups`); callers pass
         a de-duplicated `keys` collection.
         """
         new_hits: list[OffloadKey] = []
+        claimable: list[OffloadKey] = []
         for h in keys:
             if h in lookup.resolved:
                 continue
             result = parent.lookup(h, lookup.ctx)
             if result is LookupResult.HIT:
                 new_hits.append(h)
+                claimable.append(h)
                 lookup.resolved[h] = True
                 lookup.pending.discard(h)
             elif result is LookupResult.MISS:
@@ -545,8 +552,22 @@ class ServerRole:
                 lookup.pending.discard(h)
             else:
                 lookup.pending.add(h)
-        if new_hits:
-            self._pin_and_register_hits(lookup, new_hits, parent)
+                if result is LookupResult.HIT_PENDING and h not in lookup.claimed:
+                    # Present but not readable; claim once per serve. A claim
+                    # of an in-flight key is idle, and a failed promotion is
+                    # re-claimed on the next serve.
+                    claimable.append(h)
+        if claimable:
+            claim = parent.claim_hits(claimable, lookup.ctx)
+            if claim.job is not None:
+                self._register_claim(lookup, claim.job)
+            lookup.claimed.update(claimable)
+            # A key the primary cannot take this round is not served: resolve
+            # it MISS now, as a failed promotion on lookup did before, rather
+            # than leaving the consumer parked until the deadline.
+            for h in (*claim.missing_keys, *claim.rejected_keys):
+                lookup.resolved[h] = False
+                lookup.pending.discard(h)
         return new_hits
 
     def _process_inbound_lookup(
@@ -559,12 +580,10 @@ class ServerRole:
     ) -> None:
         """Resolve one enqueued LookupMsg against `parent`.
 
-        For each key, query the tiering manager via `parent.lookup`
-        and pin any HITs immediately via `parent.claim_hits`
-        (plumbed into the existing `add_stored_blocks` matching path so
-        the eventual FetchMsg finds them). HIT_PENDING / RETRY keys park
-        in `_ActiveLookup` for re-polling by
-        `_resolve_pending_lookups`.
+        For each key, `parent.lookup`, then one `parent.claim_hits`
+        over the HIT and HIT_PENDING keys: it pins the readable HITs into
+        `add_stored_blocks` and starts a promotion for a secondary copy.
+        Pending keys park in `_ActiveLookup` for re-polling.
 
         The outbound `LookupRespMsg` is deferred until every key has
         settled to HIT or MISS (or the batch-level `deadline` fires,
@@ -610,27 +629,20 @@ class ServerRole:
             # response now and close the synthetic request.
             self._finalize_lookup(lookup, parent)
 
-    def _pin_and_register_hits(
+    def _register_claim(
         self,
         lookup: _ActiveLookup,
-        keys: list[OffloadKey],
-        parent: ParentManager,
+        meta: TransferJob,
     ) -> None:
-        """Pin primary slots for HIT keys and park them as the lookup's
-        round supply via `add_stored_blocks`.
+        """Park the claimed primary slots as the lookup's round supply.
 
-        Caller has already confirmed every key is HIT, so the JobMetadata
-        returned by `parent.claim_hits` carries parallel
-        `keys`/`block_ids` of length `len(keys)`. Nothing can evict
-        between that confirmation and the pin because the whole
+        `meta.keys` are the keys the claim pinned (the readable ones); any
+        key the claim reported pending stays parked in the lookup. Nothing
+        can evict between the claim and the registration because the whole
         `serve_external_requests` call runs inside one hold of the tiering
         manager's lock -- which is why that call must never release it
         partway through.
         """
-        claim = parent.claim_hits(keys, lookup.ctx)
-        if claim.job is None:
-            return
-        meta = claim.job
         self.add_stored_blocks(
             lookup.kv_request_id,
             list(meta.keys),

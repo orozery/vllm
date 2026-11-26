@@ -505,7 +505,8 @@ def test_kvcr_tier_serves_primary_pin_request(
         def lookup(self, key, req_context):
             return LookupResult.HIT if key in hit_keys else LookupResult.MISS
 
-        def claim_hits(self, requested_keys, req_context):
+        def claim_hits(self, requested_keys, req_context, *, promote=True):
+            assert promote is False
             claimed = (
                 tuple(key for key in requested_keys if key in hit_keys)
                 if job_keys is None
@@ -519,8 +520,9 @@ def test_kvcr_tier_serves_primary_pin_request(
                     is_promotion=False,
                     req_context=req_context,
                 ),
-                [],
-                [],
+                pending_keys=[],
+                missing_keys=[],
+                rejected_keys=[],
             )
 
         def on_request_finished(self, req_context):

@@ -283,10 +283,13 @@ class FakeParent:
         stored: dict[OffloadKey, int] | None = None,
         pending: set[OffloadKey] | None = None,
         retry: set[OffloadKey] | None = None,
+        rejected: set[OffloadKey] | None = None,
     ) -> None:
         self.stored: dict[OffloadKey, int] = dict(stored or {})
         self.pending: set[OffloadKey] = set(pending or ())
         self.retry: set[OffloadKey] = set(retry or ())
+        # Keys the primary refuses to take when claimed.
+        self.rejected: set[OffloadKey] = set(rejected or ())
         self._next_job_id: int = 1000
         self.calls: list[tuple] = []
 
@@ -308,13 +311,18 @@ class FakeParent:
         self,
         keys: Sequence[OffloadKey],
         ctx: ReqContext,
+        *,
+        promote: bool = True,
     ) -> ClaimResult:
         keys_list = list(keys)
         self.calls.append(("claim_hits", tuple(keys_list), ctx.req_id))
         claimed = [k for k in keys_list if k in self.stored]
-        pending = [k for k in keys_list if k in self.pending]
+        rejected = [k for k in keys_list if k in self.rejected]
+        pending = [k for k in keys_list if k in self.pending and k not in self.rejected]
         missing = [
-            k for k in keys_list if k not in self.stored and k not in self.pending
+            k
+            for k in keys_list
+            if k not in self.stored and k not in self.pending and k not in self.rejected
         ]
         job = None
         if claimed:
@@ -328,7 +336,7 @@ class FakeParent:
                 is_promotion=False,
                 req_context=ctx,
             )
-        return ClaimResult(job, pending, missing)
+        return ClaimResult(job, pending, missing, rejected)
 
     def on_request_finished(self, ctx: ReqContext) -> None:
         self.calls.append(("on_request_finished", ctx.req_id))
@@ -1614,10 +1622,11 @@ class TestServerLookupHandling:
 
         # No LookupRespMsg yet — hB and hD are still pending.
         assert _lookup_resps(conn, sent_before) == []
-        # HIT is still pinned immediately so the eventual FetchMsg matches.
+        # HIT is pinned immediately and the pending key is claimed so its
+        # promotion starts; the claim reports only hA in the job.
         cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
         assert len(cs_calls) == 1
-        assert cs_calls[0][1] == (b"hA",)
+        assert cs_calls[0][1] == (b"hA", b"hB")
         # Lookup is parked; on_request_finished not yet called.
         assert all(c[0] != "on_request_finished" for c in cb.calls)
         assert len(_srv_lookups(session)) == 1
@@ -1653,12 +1662,33 @@ class TestServerLookupHandling:
 
         cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
         assert len(cs_calls) == 2
-        assert cs_calls[0][1] == (b"hA",)
+        # The first claim covers hA and the then-pending hB; the second
+        # claims hB once it is readable.
+        assert cs_calls[0][1] == (b"hA", b"hB")
         assert cs_calls[1][1] == (b"hB",)
         # on_request_finished fires once after the aggregate resolve.
         assert sum(1 for c in cb.calls if c[0] == "on_request_finished") == 1
         assert b"hA" in _srv_outbound(session, "req-1").available
         assert b"hB" in _srv_outbound(session, "req-1").available
+
+    def test_rejected_claim_resolves_miss_immediately(self):
+        """A key the producer's primary cannot take resolves MISS at once,
+        instead of parking the consumer until the lookup deadline."""
+        key = OffloadKey(b"hA")
+        cb = FakeParent(pending={key}, rejected={key})
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        sent_before = len(conn._sent)
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+        _serve(session, cb)
+        _serve(session, cb)
+
+        resps = _lookup_resps(conn, sent_before)
+        assert len(resps) == 1
+        assert resps[0][LookupRespMsg.KEYS] == [b"hA"]
+        assert resps[0][LookupRespMsg.HITS] == [False]
 
     def test_pending_timeout_replies_miss_no_store_job(self):
         """A HIT_PENDING key that stays pending past the batch
@@ -1685,8 +1715,32 @@ class TestServerLookupHandling:
         assert len(resps) == 1
         assert resps[0][LookupRespMsg.KEYS] == [b"hA"]
         assert resps[0][LookupRespMsg.HITS] == [False]
-        assert all(c[0] != "claim_hits" for c in cb.calls)
+        # The pending key is claimed on each poll (idempotent while a
+        # promotion is in flight), then the timeout reports MISS.
+        cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
+        assert [c[1] for c in cs_calls] == [(b"hA",), (b"hA",)]
         assert sum(1 for c in cb.calls if c[0] == "on_request_finished") == 1
+
+    def test_retry_then_pending_claims_the_key(self):
+        """A key that starts as RETRY and converges to a secondary copy is
+        claimed even though it was already parked as pending."""
+        key = OffloadKey(b"hA")
+        cb = FakeParent(retry={key})
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+        _serve(session, cb)
+        assert all(c[0] != "claim_hits" for c in cb.calls)
+
+        # The probe converges: the copy is present, not readable.
+        cb.retry.discard(key)
+        cb.pending.add(key)
+        _serve(session, cb)
+
+        cs_calls = [c for c in cb.calls if c[0] == "claim_hits"]
+        assert [c[1] for c in cs_calls] == [(b"hA",)]
 
     def test_finish_request_called_per_lookup_msg_not_per_kv_request_id(self):
         """Two LookupMsgs for the same kv_request_id get distinct ctxs

@@ -245,6 +245,14 @@ Secondary tiers, such as `fs` and `obj`, accept an optional `access_mode` field 
 | `read` | Serves loads only. The tier is never written to except possibly at initialization for probing. Use it to consume a cache populated by another instance. |
 | `write` | Accepts stores only. Lookups always miss, so the tier never serves loads. Use it to populate a shared cache that other instances read. |
 
+### Lookup, commit, and readiness
+
+With secondary tiers configured, `lookup` is a non-binding query: it reports whether a block is ready (`HIT`), present but not readable (`HIT_PENDING`), absent (`MISS`), or not yet converged (`RETRY`). It may be asked about more blocks than the request ends up reading, and it reserves nothing; a block is pinned and attributed only when the request commits. A block that only a secondary tier holds is `HIT_PENDING`: present, but nothing is moving it until the commit.
+
+A request then commits the set of keys its load will read in one call. The commit pins resident blocks, allocates a promotion slot for each key only a secondary tier holds (batched per tier), and records provenance. It runs while the request is being considered for scheduling, before its device blocks are allocated, and the pins it takes last until the load is prepared, the request finishes, or the cache resets. A promoted block is not readable until its transfer completes, so the connector reports no hit until the whole committed set is readable. A commit that cannot take every key releases what it took and the request recomputes. Once readable, the load is prepared and the pins transfer to it; that call is the first sign the committed set will be read, and if it never comes the plan is released.
+
+Provenance is recorded at commit: the request that promotes a disk or P2P block reports that tier as the source, while a later request that finds the block already promoted reports `HOST`. Serve-side claims (`claim_hits`) follow the same rules: they pin readable blocks, claim pending ones (starting a promotion when allowed), and report absent or non-promotable blocks as missing.
+
 ### Threading model
 
 Tier methods run in the scheduler process, under the tiering manager's lock, so they are never entered concurrently. They are not always called from the same thread, though.
