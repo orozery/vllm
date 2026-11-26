@@ -86,6 +86,9 @@ class _LookupProbe:
     ready_keys: set[OffloadKey] = field(default_factory=set)
     # Leading readable chunks of the last full-attention scan.
     confirmed_prefix: int = 0
+    # Readable tokens of the full-attention prefix. The tail search may extend
+    # past it, but the shared-prefix junction may not.
+    confirmed_fa_boundary: int | None = None
 
 
 def _parse_tier_filter(raw: Any) -> TierFilter:
@@ -664,15 +667,9 @@ class OffloadingConnectorScheduler:
                     and (looked_up_full_attention or not self._full_attention_groups)
                 ):
                     # Groups before the first sparse group are full attention.
-                    if self._full_attention_groups:
-                        confirmed = (
-                            max_hit_size_tokens
-                            if confirmed_fa_boundary is None
-                            else min(max_hit_size_tokens, confirmed_fa_boundary)
-                        )
-                    else:
-                        confirmed = 0
-                    full_attention_hit_boundary = confirmed
+                    full_attention_hit_boundary = (
+                        max_hit_size_tokens if self._full_attention_groups else 0
+                    )
 
                 num_chunks = min(
                     cdiv(max_hit_size_tokens, tokens_per_chunk), len(offload_keys)
@@ -710,6 +707,8 @@ class OffloadingConnectorScheduler:
                         confirmed_fa_boundary = min(
                             confirmed_fa_boundary, confirmed_tokens
                         )
+                    if probe is not None:
+                        probe.confirmed_fa_boundary = confirmed_fa_boundary
                 else:
                     required_window = sliding_window_size_in_chunks
                     candidate_end = min(
@@ -817,9 +816,14 @@ class OffloadingConnectorScheduler:
             max_num_new_tokens,
             probe,
         )
-        if num_hit_tokens is not None and full_attention_hit_boundary is not None:
+        # The tail search may look past the readable prefix; the junction may
+        # not, since a pending chunk would pin state the recompute lacks.
+        junction_boundary = probe.confirmed_fa_boundary
+        if junction_boundary is None:
+            junction_boundary = full_attention_hit_boundary
+        if num_hit_tokens is not None and junction_boundary is not None:
             self._maybe_register_shared_prefix_junction(
-                req_status, full_attention_hit_boundary, num_hit_tokens
+                req_status, junction_boundary, num_hit_tokens
             )
         return num_hit_tokens
 

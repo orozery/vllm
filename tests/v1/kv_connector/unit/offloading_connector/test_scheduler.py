@@ -1500,8 +1500,9 @@ def test_shared_prefix_junction_is_not_lowered():
     assert request.shared_prefix_boundary == 24
 
 
-def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
-    """A pending chunk outside the converged hit must not hide the junction."""
+def _make_pending_attention_scheduler():
+    """Full attention readable to 32 with its third chunk pending; two
+    window-16 sparse groups cut the converged hit to 16."""
     config = create_vllm_config(
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
@@ -1544,10 +1545,29 @@ def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
         is not None
     )
     assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+    return scheduler, request, manager, producer, pending
+
+
+def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
+    """A pending chunk outside the converged hit must not hide the junction."""
+    scheduler, request, manager, producer, pending = _make_pending_attention_scheduler()
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
     assert request.shared_prefix_boundary == 32
     assert manager.lookup(pending[0], producer) is LookupResult.HIT_PENDING
+
+
+def test_pending_attention_bounds_the_junction_not_the_tail_search():
+    """The split behind the junction: a pending chunk caps the readable prefix
+    the junction may use, but not the boundary the partial-tail search reaches."""
+    scheduler, request, _, _, _ = _make_pending_attention_scheduler()
+    req_status = scheduler._req_status[request.request_id]
+    req_status.update_offload_keys()
+
+    probe = scheduler_module._LookupProbe()
+    hit, search_boundary = scheduler._lookup_complete_chunks(req_status, None, probe)
+    assert (hit, search_boundary) == (16, 48)
+    assert probe.confirmed_fa_boundary == 32
 
 
 def test_unconfirmed_attention_does_not_register_junction():
@@ -2248,9 +2268,10 @@ def test_partial_lookup_defers_while_anchor_chunk_is_loading():
 
 
 @pytest.mark.cpu_test
-def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
-    # A pending anchor chunk cannot confirm the boundary the tail search needs,
-    # so the tail is not reported; the request is not deferred either.
+def test_partial_lookup_finds_a_tail_above_a_pending_anchor_chunk():
+    # The full-attention anchor chunk is present but not readable yet. The tail
+    # beyond it is still found; the commit then defers until the plan's chunks,
+    # including that anchor, are readable.
     scheduler = _make_partial_tail_scheduler()
     _, req_status = _make_anchored_partial_tail_request(
         scheduler, {0: {b"h6"}, 1: {b"h6"}}
@@ -2263,8 +2284,8 @@ def test_partial_lookup_does_not_defer_on_pending_anchor_chunk():
         return resident(key, req_context)
 
     scheduler.manager.lookup.side_effect = lookup
-    assert scheduler._lookup(req_status) == 0
-    assert req_status.partial_tail_boundary is None
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.partial_tail_boundary == 28
 
 
 @pytest.mark.cpu_test
