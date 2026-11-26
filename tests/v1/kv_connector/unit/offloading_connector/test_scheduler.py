@@ -1901,6 +1901,21 @@ def test_external_cache_hit_sources_range_boundaries(ranges, expected):
     assert sum(result.values()) == 12
 
 
+def test_external_cache_hit_sources_prefer_the_commit_map():
+    """The connector uses the map commit_hits returned, not a manager round-trip."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    state = scheduler._req_status[request.request_id]
+    state.num_locally_computed_tokens = 0
+    key = make_offload_key(b"h3", 0)
+    state.load_key_ranges.append((0, 16, key))
+    state.load_sources = {key: CacheHitSource.DISK}
+
+    assert scheduler.get_external_cache_hit_sources(request, 16) == {
+        CacheHitSource.DISK: 16
+    }
+
+
 @pytest.mark.parametrize("source", ["host", "disk", "p2p", "external_unspecified"])
 def test_external_cache_hit_sources_recurrent_only_state(source):
     scheduler = _make_partial_tail_scheduler(recurrent_only=True)

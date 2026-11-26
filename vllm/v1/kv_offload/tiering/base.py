@@ -156,8 +156,9 @@ class ParentManager(ABC):
 
     Steps 2-3 may be interleaved. Step 4 must be called even if no
     chunks were found, to avoid leaking async lookup state (e.g. in
-    the fs tier's AsyncLookupManager). A caller that wants a secondary
-    copy promoted claims it through `claim_hits()`.
+    the fs tier's AsyncLookupManager). `lookup()` never promotes, so a
+    caller that wants a secondary copy promoted claims it through
+    `claim_hits()`.
     """
 
     @abstractmethod
