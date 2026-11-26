@@ -2215,6 +2215,28 @@ def test_committed_plan_is_rechecked_without_rewalking():
 
 
 @pytest.mark.cpu_test
+def test_deferred_load_keeps_its_plan_live():
+    """An accepted async load whose callback the core defers keeps its plan
+    live, so the end-of-step hook does not release the pins it will rely on."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.committed_plan is not None
+    output = MagicMock()
+    output.num_scheduled_tokens = {}
+
+    # Waiting for device blocks: the plan is not live.
+    request.status = RequestStatus.WAITING
+    assert scheduler._live_plan_req_ids(output) == set()
+
+    # The load was accepted; only its deferred callback is outstanding.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._live_plan_req_ids(output) == {"req"}
+
+
+@pytest.mark.cpu_test
 def test_unconverged_lookup_defers_before_commit():
     """A key the walk did not confirm that is still converging defers the
     request instead of refusing the whole committed set."""
@@ -2250,6 +2272,25 @@ def test_committed_plan_defers_while_a_key_is_loading():
 
     scheduler._chunks_being_loaded = set(plan.keys)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+
+
+@pytest.mark.cpu_test
+def test_ready_plan_recommits_to_repin():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    manager = scheduler.manager
+
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    plan = req_status.committed_plan
+    assert plan is not None
+
+    _as_mock(manager.commit_hits).reset_mock()
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    _as_mock(manager.commit_hits).assert_called_once_with(
+        plan.keys, req_status.req_context
+    )
 
 
 @pytest.mark.cpu_test

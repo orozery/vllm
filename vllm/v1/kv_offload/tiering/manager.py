@@ -861,9 +861,9 @@ class TieringOffloadingManager(OffloadingManager):
         defers until every committed key is readable, then calls prepare_load.
 
         Runs while the request is considered for scheduling, before its device
-        blocks are allocated. The pins last until `prepare_load` or request
-        finish; a repeat call reconciles the plan, and an empty set releases
-        it.
+        blocks are allocated; an unscheduled request's pins are released at
+        the end of the step. A repeat call reconciles the plan and re-pins
+        readable keys; an empty set releases it.
 
         Args:
             keys: Every key the load will read.
@@ -897,6 +897,7 @@ class TieringOffloadingManager(OffloadingManager):
             if not keys:
                 self._release_plan(req_id)
                 return None
+            self._pin_committed(state, keys)
             return {key: state.sources[key] for key in keys}
 
         resident: list[OffloadKey] = []
@@ -1587,6 +1588,26 @@ class TieringOffloadingManager(OffloadingManager):
         # safe: _maybe_finalize_request() holds off while pending_cascade_keys is
         # non-empty, so nothing finalizes early and the list still drains.
         self._flush_pending_cascades()
+        # A plan whose request was not scheduled this step must not hold pins
+        # while it waits for device blocks, unless its own promotion is in
+        # flight: that work is still on its behalf, and dropping the pins only
+        # invites the eviction that would repeat it.
+        if context.scheduled_req_ids is not None:
+            live = set(context.scheduled_req_ids)
+            live.update(
+                job.transfer_job.req_context.req_id
+                for job in self._jobs.values()
+                if job.transfer_job.is_promotion
+            )
+            live.update(
+                req_id
+                for pending_by_ctx in self._pending_load_submissions.values()
+                for req_id in pending_by_ctx
+            )
+            for req_id, plan in self._req_state.items():
+                if req_id in live or not plan.pinned:
+                    continue
+                self._unpin_committed(plan, list(plan.pinned))
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
 
