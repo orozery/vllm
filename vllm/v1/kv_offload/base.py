@@ -376,17 +376,32 @@ class OffloadingManager(ABC):
         """
         pass
 
-    def get_load_source(
-        self, key: OffloadKey, req_context: ReqContext
-    ) -> CacheHitSource:
-        """Return the cache tier that supplied a successful lookup.
+    @abstractmethod
+    def commit_hits(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> Mapping[OffloadKey, CacheHitSource] | None:
+        """Commit to reading `keys` after a converged `lookup`.
 
-        This is queried only after `lookup` resolves to `HIT`. Composing
-        managers can override it to retain the origin across asynchronous
-        promotion into a primary tier. The default keeps out-of-tree managers
-        compatible while making unknown provenance explicit.
+        The caller looks keys up first, then commits to the set it will read.
+        A manager that must allocate does so here.
+
+        Timing: this runs while the request is being considered for
+        scheduling, after `on_new_request` and before its device blocks are
+        allocated. It reserves the offloaded side only: the pins last until
+        `prepare_load`/`complete_load` or request finish. An empty `keys`
+        releases the plan, so it must be handled as a release, not a no-op.
+
+        Args:
+            keys: Every key the load will read.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            A mapping from each key to the tier it came from, or None if the
+            set cannot be committed. None means the caller prefills; a
+            committed set is never empty, so an empty `keys` returns None.
+
         """
-        return CacheHitSource.EXTERNAL_UNSPECIFIED
+        pass
 
     @abstractmethod
     def prepare_load(
