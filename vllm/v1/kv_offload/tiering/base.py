@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 
@@ -92,6 +92,27 @@ class TransferJob:
     submit_time: float = field(default_factory=time.monotonic)
 
 
+class ClaimResult(NamedTuple):
+    """Outcome of `ParentManager.claim_hits()` over a set of keys.
+
+    A claim pins the chunks it can serve and reports the rest, so a caller
+    never has to retry a rejected key on its own.
+
+    Attributes:
+        job: The transfer job covering the keys pinned by this claim, or None if
+            no key could be pinned.
+        pending_keys: Keys that are present but not yet readable, or whose
+            asynchronous lookup has not converged. The caller keeps waiting
+            for these and claims them once readable.
+        missing_keys: Keys that are absent from every tier the claim may read.
+
+    """
+
+    job: TransferJob | None
+    pending_keys: list[OffloadKey]
+    missing_keys: list[OffloadKey]
+
+
 @dataclass(slots=True)
 class JobResult:
     """Result of an async transfer job."""
@@ -125,7 +146,7 @@ class ParentManager(ABC):
         1. on_new_request(req_context)  — set up per-request state
         2. lookup(key, req_context)     — check chunk availability
            (repeat per chunk)
-        3. create_store_job(keys, req_context) — pin chunks and get a
+        3. claim_hits(keys, req_context) — pin readable chunks and get a
            job handle
         4. on_request_finished(req_context) — clean up per-request state
 
@@ -141,11 +162,23 @@ class ParentManager(ABC):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult: ...
 
     @abstractmethod
-    def create_store_job(
+    def claim_hits(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> TransferJob: ...
+    ) -> ClaimResult:
+        """Claim chunks in the primary tier for a peer transfer.
+
+        `HIT` keys are pinned and included in the job. `HIT_PENDING` and
+        `RETRY` keys are reported pending for a later claim. A `MISS` key is
+        missing.
+
+        Args:
+            keys: Chunks to claim.
+            req_context: Per-request context.
+
+        """
+        ...
 
     @abstractmethod
     def on_request_finished(self, req_context: ReqContext) -> None: ...

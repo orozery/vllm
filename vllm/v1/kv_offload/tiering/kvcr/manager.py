@@ -200,7 +200,10 @@ class _FrameworkPinAdapter:
             if not hit_keys:
                 return None
 
-            job = parent.create_store_job(hit_keys, req_context)
+            claim = parent.claim_hits(hit_keys, req_context)
+            job = claim.job
+            if job is None:
+                return None
             job_keys = tuple(job.keys)
             if len(job_keys) != len(job.chunk_ids) or (
                 job_keys is not hit_keys and set(job_keys) != set(hit_keys)

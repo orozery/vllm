@@ -560,7 +560,7 @@ class ServerRole:
         """Resolve one enqueued LookupMsg against `parent`.
 
         For each key, query the tiering manager via `parent.lookup`
-        and pin any HITs immediately via `parent.create_store_job`
+        and pin any HITs immediately via `parent.claim_hits`
         (plumbed into the existing `add_stored_blocks` matching path so
         the eventual FetchMsg finds them). HIT_PENDING / RETRY keys park
         in `_ActiveLookup` for re-polling by
@@ -620,14 +620,17 @@ class ServerRole:
         round supply via `add_stored_blocks`.
 
         Caller has already confirmed every key is HIT, so the JobMetadata
-        returned by `parent.create_store_job` carries parallel
+        returned by `parent.claim_hits` carries parallel
         `keys`/`block_ids` of length `len(keys)`. Nothing can evict
         between that confirmation and the pin because the whole
         `serve_external_requests` call runs inside one hold of the tiering
         manager's lock -- which is why that call must never release it
         partway through.
         """
-        meta = parent.create_store_job(keys, lookup.ctx)
+        claim = parent.claim_hits(keys, lookup.ctx)
+        if claim.job is None:
+            return
+        meta = claim.job
         self.add_stored_blocks(
             lookup.kv_request_id,
             list(meta.keys),
@@ -647,7 +650,7 @@ class ServerRole:
         results into `resolved`. If `deadline` has passed, remaining
         `pending` keys are force-resolved to MISS so the consumer
         can fall back instead of waiting on a stuck producer. Newly-HIT
-        keys are pinned via `parent.create_store_job` in one call per
+        keys are pinned via `parent.claim_hits` in one call per
         affected lookup. Lookups whose `pending` empties out get their
         aggregated LookupRespMsg sent by `_finalize_lookup`.
         """
@@ -706,7 +709,7 @@ class ServerRole:
 
         Pops every parked `_ActiveLookup` for this id (so
         `_resolve_pending_lookups` cannot promote a HIT_PENDING /
-        RETRY key into a fresh `parent.create_store_job` after this
+        RETRY key into a fresh `parent.claim_hits` after this
         point) and queues each `lookup.ctx` for
         `parent.on_request_finished` (fired by the next
         `serve_external_requests`, since no parent handle is available

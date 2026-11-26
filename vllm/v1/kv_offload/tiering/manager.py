@@ -52,6 +52,7 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
     TIER_LABEL,
+    ClaimResult,
     JobId,
     JobResult,
     ParentManager,
@@ -265,10 +266,10 @@ class _SecondaryTierFacingParent(ParentManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         return self._m.lookup(key, req_context, exclude_tier_idx=self._origin_idx)
 
-    def create_store_job(
+    def claim_hits(
         self, keys: Collection[OffloadKey], req_context: ReqContext
-    ) -> TransferJob:
-        return self._m.create_store_job(keys, req_context, self._origin_idx)
+    ) -> ClaimResult:
+        return self._m._claim(keys, req_context, self._origin_idx)
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         return self._m.on_request_finished(
@@ -962,7 +963,7 @@ class TieringOffloadingManager(OffloadingManager):
         # _process_finished_jobs() handles two kinds of completions here:
         #  - Cascade completions (store to a secondary tier, either a local
         #    cascade or a store job created for a remote requester via
-        #    create_store_job()): decrements ref_cnt on the primary chunks
+        #    claim_hits()): decrements ref_cnt on the primary chunks
         #    that were read, making them evictable again once ref_cnt hits 0.
         #  - Promotion completions (secondary->primary loads): sets a
         #    not-yet-ready chunk's ref_cnt from -1 to 0 via complete_write(),
@@ -1043,8 +1044,9 @@ class TieringOffloadingManager(OffloadingManager):
             tier = self.secondary_tiers[tier_idx]
             if not self._should_store_to_tier(tier, len(ready_keys)):
                 continue
-            job_metadata = self.create_store_job(ready_keys, req_context, tier_idx)
-            tier.submit_store(job_metadata)
+            claim = self._claim(ready_keys, req_context, tier_idx)
+            if claim.job is not None:
+                tier.submit_store(claim.job)
 
     def _flush_pending_cascades(self) -> None:
         """Retry request-level cascades parked on an in-flight primary write.
@@ -1105,8 +1107,9 @@ class TieringOffloadingManager(OffloadingManager):
                     continue
                 if not self._should_store_to_tier(tier, len(keys)):
                     continue
-                job_metadata = self.create_store_job(keys, req_context, tier_idx)
-                tier.submit_store(job_metadata)
+                claim = self._claim(keys, req_context, tier_idx)
+                if claim.job is not None:
+                    tier.submit_store(claim.job)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -1114,33 +1117,44 @@ class TieringOffloadingManager(OffloadingManager):
         state.pending_primary_stores -= 1
         self._maybe_finalize_request(req_id)
 
-    def create_store_job(
+    def _claim(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
         tier_idx: int = 0,
-    ) -> TransferJob:
-        """Pin chunks in the primary tier and create a tracked store job.
+    ) -> ClaimResult:
+        """Pin readable chunks for a peer transfer and create a tracked job.
 
-        Calls prepare_read() to increment ref_cnt (protecting chunks
-        from eviction during the async transfer), allocates a job ID,
-        and registers the job in _jobs.
-
-        The caller is responsible for the actual data transfer and
-        reporting completion via get_finished_jobs().
+        Readable chunks are pinned with prepare_read() (protecting them from
+        eviction during the async transfer) and covered by the returned job;
+        the rest are reported so the caller does not retry them blindly.
         """
-        primary_chunks_spec = self.primary_tier.prepare_read(keys, req_context)
-        assert isinstance(primary_chunks_spec, CPULoadStoreSpec)
-        job_id = self._next_job_id()
-        job_metadata = TransferJob(
-            job_id=job_id,
-            keys=keys,
-            chunk_ids=primary_chunks_spec.chunk_ids,
-            is_promotion=False,
-            req_context=req_context,
-        )
-        self._register_job(job_metadata, tier_idx)
-        return job_metadata
+        keys = list(dict.fromkeys(keys))
+        resident: list[OffloadKey] = []
+        pending: list[OffloadKey] = []
+        missing: list[OffloadKey] = []
+        for key in keys:
+            result = self.primary_tier.lookup(key, req_context)
+            if result is LookupResult.HIT:
+                resident.append(key)
+            elif result is LookupResult.MISS:
+                missing.append(key)
+            else:
+                pending.append(key)
+
+        job: TransferJob | None = None
+        if resident:
+            primary_chunks_spec = self.primary_tier.prepare_read(resident, req_context)
+            assert isinstance(primary_chunks_spec, CPULoadStoreSpec)
+            job = TransferJob(
+                job_id=self._next_job_id(),
+                keys=resident,
+                chunk_ids=primary_chunks_spec.chunk_ids,
+                is_promotion=False,
+                req_context=req_context,
+            )
+            self._register_job(job, tier_idx)
+        return ClaimResult(job, pending, missing)
 
     @override
     def on_new_request(
