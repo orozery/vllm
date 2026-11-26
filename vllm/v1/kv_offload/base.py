@@ -192,6 +192,9 @@ class ScheduleEndContext(NamedTuple):
     new_req_ids: Collection[str]
     # Request IDs preempted this step.
     preempted_req_ids: Collection[str]
+    # Requests scheduled this step. A plan whose request is absent releases
+    # its pins. None means unknown, so pins are not expired.
+    scheduled_req_ids: Collection[str] | None = None
 
 
 class LoadStoreSpec:
@@ -391,9 +394,11 @@ class OffloadingManager(ABC):
 
         Timing: this runs while the request is being considered for
         scheduling, after `on_new_request` and before its device blocks are
-        allocated. It reserves the offloaded side only: the pins last until
-        `prepare_load`/`complete_load` or request finish. An empty `keys`
-        releases the plan, so it must be handled as a release, not a no-op.
+        allocated. It reserves the offloaded side only; an unscheduled
+        request's pins are released at the end of the step, and its plan at
+        finish or cache reset. An empty `keys` releases the plan, so it must
+        be handled as a release, not a no-op. A repeat call re-pins recorded
+        keys that are readable now.
 
         The default reserves nothing, so a key that is present is committable
         even while it is still becoming readable (HIT_PENDING); it refuses the
@@ -540,6 +545,10 @@ class OffloadingManager(ABC):
 
         Managers may override this to flush deferred work accumulated
         during the step (e.g., batched promotions).
+
+        `ScheduleEndContext.scheduled_req_ids` names the requests whose
+        committed plan is still live, so a manager that pins committed keys can
+        release the rest.
 
         A tier manager reports only events for storage state it owns. A
         composing manager may aggregate child event streams, but should not

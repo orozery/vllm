@@ -108,6 +108,8 @@ class RequestState:
     # The request's committed load: keys and their provenance. Non-empty means
     # a plan exists, and its keys are the keys the load is waiting on.
     sources: dict[OffloadKey, CacheHitSource] = field(default_factory=dict)
+    # Commit pins held on readable chunks.
+    pinned: set[OffloadKey] = field(default_factory=set)
 
 
 class JobMetadata(NamedTuple):
@@ -586,6 +588,7 @@ class TieringOffloadingManager(OffloadingManager):
                 transfer_job.req_context,
                 True,
             )
+            self._pin_plan_keys(successful_keys)
         if not failed_keys:
             assert completed_job.deferred_release is None
         elif completed_job.deferred_release is not None:
@@ -819,7 +822,9 @@ class TieringOffloadingManager(OffloadingManager):
         All-or-nothing: a set it cannot take is released and None returned.
 
         Runs while the request is considered for scheduling, before its device
-        blocks are allocated. An empty set releases the plan.
+        blocks are allocated; an unscheduled request's pins are released at
+        the end of the step. A repeat call reconciles the plan and re-pins
+        readable keys; an empty set releases it.
 
         Args:
             keys: Every key the load will read.
@@ -844,6 +849,7 @@ class TieringOffloadingManager(OffloadingManager):
             if not keys:
                 self._release_plan(req_id)
                 return None
+            self._pin_committed(state, keys)
             return {key: state.sources[key] for key in keys}
 
         for key in new_keys:
@@ -851,12 +857,57 @@ class TieringOffloadingManager(OffloadingManager):
                 self._release_plan(req_id)
                 return None
         state.sources.update(dict.fromkeys(new_keys, self.primary_hit_source))
+        self._pin_committed(state, keys)
         return {key: state.sources[key] for key in keys}
 
+    def _pin_committed(self, state: RequestState, keys: Collection[OffloadKey]) -> None:
+        """Pin recorded keys that are readable and not yet pinned."""
+        req_context = state.req_context
+        fresh = [
+            key
+            for key in keys
+            if key not in state.pinned
+            and self.primary_tier.lookup(key, req_context) is LookupResult.HIT
+        ]
+        if not fresh:
+            return
+        # Internal housekeeping; prepare_load records the request access.
+        self.primary_tier.prepare_read(fresh, req_context)
+        state.pinned.update(fresh)
+
+    def _unpin_committed(
+        self, state: RequestState, keys: Collection[OffloadKey]
+    ) -> None:
+        """Release commit pins held for `keys`, leaving already-loaded pins."""
+        release = [key for key in dict.fromkeys(keys) if key in state.pinned]
+        if not release:
+            return
+        state.pinned.difference_update(release)
+        self.primary_tier.complete_load(release, state.req_context)
+
+    def _plan_waiters(
+        self, keys: Collection[OffloadKey]
+    ) -> list[tuple[RequestState, list[OffloadKey]]]:
+        """Committed plans still waiting on any of `keys`."""
+        waiters: list[tuple[RequestState, list[OffloadKey]]] = []
+        for state in self._req_state.values():
+            if not state.sources:
+                continue
+            common = [key for key in keys if key in state.sources]
+            if common:
+                waiters.append((state, common))
+        return waiters
+
+    def _pin_plan_keys(self, keys: Collection[OffloadKey]) -> None:
+        """Pin newly readable chunks for every request that committed them."""
+        for state, wait_keys in self._plan_waiters(keys):
+            self._pin_committed(state, wait_keys)
+
     def _release_plan(self, req_id: str) -> None:
-        """Drop a request's recorded plan."""
+        """Drop a request's committed plan, releasing everything it took."""
         state = self._req_state.get(req_id)
         if state is not None:
+            self._unpin_committed(state, list(state.pinned))
             state.sources.clear()
 
     def _initiate_promotion(
@@ -959,6 +1010,11 @@ class TieringOffloadingManager(OffloadingManager):
             LoadStoreSpec for reading from primary tier.
 
         """
+        state = self._req_state.get(req_context.req_id)
+        if state is not None:
+            # The plan is issued; release the pins it holds.
+            self._unpin_committed(state, list(state.pinned))
+            state.sources.clear()
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
@@ -1138,6 +1194,8 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.complete_store(
             keys, req_context, trigger=trigger, success=success
         )
+        if success:
+            self._pin_plan_keys(keys)
 
         req_id = req_context.req_id
         state = self._req_state[req_id]
@@ -1284,6 +1342,26 @@ class TieringOffloadingManager(OffloadingManager):
         # safe: _maybe_finalize_request() holds off while pending_cascade_keys is
         # non-empty, so nothing finalizes early and the list still drains.
         self._flush_pending_cascades()
+        # A plan whose request was not scheduled this step must not hold pins
+        # while it waits for device blocks, unless its own promotion is in
+        # flight: that work is still on its behalf, and dropping the pins only
+        # invites the eviction that would repeat it.
+        if context.scheduled_req_ids is not None:
+            live = set(context.scheduled_req_ids)
+            live.update(
+                job.transfer_job.req_context.req_id
+                for job in self._jobs.values()
+                if job.transfer_job.is_promotion
+            )
+            live.update(
+                req_id
+                for pending_by_ctx in self._pending_load_submissions.values()
+                for req_id in pending_by_ctx
+            )
+            for req_id, plan in self._req_state.items():
+                if req_id in live or not plan.pinned:
+                    continue
+                self._unpin_committed(plan, list(plan.pinned))
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
 
@@ -1370,6 +1448,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._pending_load_submissions.clear()
         for state in self._req_state.values():
             state.sources.clear()
+            state.pinned.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []

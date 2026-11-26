@@ -2108,6 +2108,31 @@ def test_committed_set_must_be_readable_before_the_hit_is_reported():
     assert scheduler.get_num_new_matched_tokens(request, 0)[0] == 10
 
 
+@pytest.mark.cpu_test
+def test_deferred_load_keeps_its_plan_live():
+    """An accepted async load whose callback the core defers keeps its plan
+    live, so the end-of-step hook does not release the pins it will rely on."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    scheduler.manager.commit_hits.return_value = {
+        make_offload_key(b"h3", 0): CacheHitSource.HOST
+    }
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] > 0
+    assert req_status.load_sources
+    output = MagicMock()
+    output.num_scheduled_tokens = {}
+
+    # Waiting for device blocks: the plan is not live.
+    request.status = RequestStatus.WAITING
+    assert scheduler._live_plan_req_ids(output) == set()
+
+    # The load was accepted; only its deferred callback is outstanding.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._live_plan_req_ids(output) == {"req"}
+
+
 def _make_anchored_partial_tail_request(scheduler, hits, num_tokens=30):
     """16-token chunks, hash 4: FA chunk [0,16) is h3, [16,32) is h7; a
     30-token prompt's tail at 28 is h6. `hits` holds what each group has
