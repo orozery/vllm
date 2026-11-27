@@ -433,7 +433,7 @@ class _RecordingParent:
     def lookup(self, key, ctx):
         return LookupResult.MISS
 
-    def create_store_job(self, keys, ctx):
+    def claim_hits(self, keys, ctx):
         raise AssertionError("unreachable")
 
     def on_request_finished(self, ctx) -> None:

@@ -52,6 +52,7 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
     TIER_LABEL,
+    ClaimResult,
     JobId,
     JobResult,
     ParentManager,
@@ -115,6 +116,13 @@ class RequestState:
 class JobMetadata(NamedTuple):
     transfer_job: TransferJob
     tier_idx: int
+
+
+class _SecondaryCopy(NamedTuple):
+    """Where a key was found, or that no tier has converged yet."""
+
+    tier_idx: int | None
+    result: LookupResult
 
 
 class _DeferredRelease(NamedTuple):
@@ -270,10 +278,16 @@ class _SecondaryTierFacingParent(ParentManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         return self._m.lookup(key, req_context, exclude_tier_idx=self._origin_idx)
 
-    def create_store_job(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
-    ) -> TransferJob:
-        return self._m.create_store_job(keys, req_context, self._origin_idx)
+    def claim_hits(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        *,
+        promote: bool = True,
+    ) -> ClaimResult:
+        return self._m._claim(
+            keys, req_context, self._origin_idx, promote=promote, track_claim=True
+        )
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         return self._m.on_request_finished(
@@ -354,6 +368,13 @@ class TieringOffloadingManager(OffloadingManager):
         # Secondary tiers are finalized only after pending primary stores reach
         # complete_store(), since complete_store() can still submit cascades.
         self._req_state: dict[str, RequestState] = {}
+
+        # Serve claims: req_id -> (key, claiming tier) -> job id holding that
+        # key's primary pin. A repeated claim joins the existing pin instead
+        # of pinning the chunk twice; the tier is part of the key because a
+        # local request legitimately claims the same chunk once per cascade
+        # destination.
+        self._serve_claims: dict[str, dict[tuple[OffloadKey, int], JobId]] = {}
 
         # Cached ParentManager wrappers for each secondary tier.
         self._tier_parents: dict[SecondaryTierManager, _SecondaryTierFacingParent] = {
@@ -656,6 +677,12 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
+                    self._forget_claims(
+                        transfer_job.req_context.req_id,
+                        transfer_job.job_id,
+                        transfer_job.keys,
+                        job_metadata.tier_idx,
+                    )
                     self._update_backpressure(tier, job_metadata, completed_job)
             if self._deferred_releases:
                 self._complete_deferred_releases(i)
@@ -861,6 +888,70 @@ class TieringOffloadingManager(OffloadingManager):
         self._pin_committed(state, keys)
         return {key: state.plan_sources[key] for key in keys}
 
+    def _find_secondary_copy(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext,
+        exclude_tier_idx: int | None = None,
+    ) -> _SecondaryCopy | None:
+        """Return the first secondary copy of `key`, or RETRY if no tier has
+        converged; None when no allowed tier holds it."""
+        any_retry = False
+        for i, tier in enumerate(self.secondary_tiers):
+            if i == exclude_tier_idx:
+                continue
+            if not tier.access_mode.can_read:
+                continue
+            if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
+                continue
+            result = tier.lookup(key, req_context)
+            if result is LookupResult.HIT:
+                return _SecondaryCopy(i, result)
+            if result is LookupResult.RETRY:
+                any_retry = True
+        if any_retry:
+            return _SecondaryCopy(None, LookupResult.RETRY)
+        return None
+
+    def _queue_promotion(
+        self,
+        tier_idx: int,
+        write: PrepareStoreOutput,
+        req_context: ReqContext,
+    ) -> None:
+        """Queue an allocated secondary-to-primary write for batched submit."""
+        store_spec = write.store_spec
+        assert isinstance(store_spec, CPULoadStoreSpec)
+        tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
+        ctx_id = req_context.req_id
+        if ctx_id not in tier_pending:
+            tier_pending[ctx_id] = PendingPromotion(
+                keys=[], chunk_ids=[], req_context=req_context
+            )
+        entry = tier_pending[ctx_id]
+        entry.keys.extend(write.keys_to_store)
+        entry.chunk_ids.extend(store_spec.chunk_ids)
+
+    def _locate(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext,
+        exclude_tier_idx: int | None = None,
+        *,
+        promote: bool = True,
+    ) -> tuple[LookupResult, int | None]:
+        """Where `key` is now, and the tier to promote it from if it is not
+        resident. HIT_PENDING without a tier is a primary write in flight."""
+        result = self.primary_tier.lookup(key, req_context)
+        if result is not LookupResult.MISS or not promote or self._promotions_held:
+            return result, None
+        copy = self._find_secondary_copy(key, req_context, exclude_tier_idx)
+        if copy is None:
+            return LookupResult.MISS, None
+        if copy.result is LookupResult.RETRY:
+            return LookupResult.RETRY, None
+        return LookupResult.HIT_PENDING, copy.tier_idx
+
     def _pin_committed(self, state: RequestState, keys: Collection[OffloadKey]) -> None:
         """Pin recorded keys that are readable and not yet pinned."""
         req_context = state.req_context
@@ -928,25 +1019,30 @@ class TieringOffloadingManager(OffloadingManager):
             self._metrics.on_promotion_allocation_failure()
             return False
 
-        store_spec = primary_write_result.store_spec
-        assert isinstance(store_spec, CPULoadStoreSpec)
         state = self._req_state.get(req_context.req_id)
         if state is not None:
             source = self.secondary_tiers[tier_idx].cache_hit_source
             for promoted_key in primary_write_result.keys_to_store:
                 state.plan_sources[promoted_key] = source
-        # Defer submit_load to on_schedule_end(). Group by (tier, request) so
-        # each request's chunks are submitted as one batched job per tier.
-        tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
-        ctx_id = req_context.req_id
-        if ctx_id not in tier_pending:
-            tier_pending[ctx_id] = PendingPromotion(
-                keys=[], chunk_ids=[], req_context=req_context
-            )
-        entry = tier_pending[ctx_id]
-        entry.keys.extend(primary_write_result.keys_to_store)
-        entry.chunk_ids.extend(store_spec.chunk_ids)
+        # Defer submit_load to on_schedule_end(), batched per (tier, request).
+        self._queue_promotion(tier_idx, primary_write_result, req_context)
         return True
+
+    def _forget_claims(
+        self,
+        req_id: str,
+        job_id: JobId,
+        keys: Collection[OffloadKey],
+        tier_idx: int,
+    ) -> None:
+        claims = self._serve_claims.get(req_id)
+        if claims is None:
+            return
+        for key in keys:
+            if claims.get((key, tier_idx)) == job_id:
+                del claims[(key, tier_idx)]
+        if not claims:
+            self._serve_claims.pop(req_id, None)
 
     def _plan_waiters(
         self, keys: Collection[OffloadKey]
@@ -1063,7 +1159,7 @@ class TieringOffloadingManager(OffloadingManager):
         # _process_finished_jobs() handles two kinds of completions here:
         #  - Cascade completions (store to a secondary tier, either a local
         #    cascade or a store job created for a remote requester via
-        #    create_store_job()): decrements ref_cnt on the primary chunks
+        #    claim_hits()): decrements ref_cnt on the primary chunks
         #    that were read, making them evictable again once ref_cnt hits 0.
         #  - Promotion completions (secondary->primary loads): sets a
         #    not-yet-ready chunk's ref_cnt from -1 to 0 via complete_write(),
@@ -1144,8 +1240,9 @@ class TieringOffloadingManager(OffloadingManager):
             tier = self.secondary_tiers[tier_idx]
             if not self._should_store_to_tier(tier, len(ready_keys)):
                 continue
-            job_metadata = self.create_store_job(ready_keys, req_context, tier_idx)
-            tier.submit_store(job_metadata)
+            claim = self._claim(ready_keys, req_context, tier_idx, promote=False)
+            if claim.job is not None:
+                tier.submit_store(claim.job)
 
     def _flush_pending_cascades(self) -> None:
         """Retry request-level cascades parked on an in-flight primary write.
@@ -1208,8 +1305,9 @@ class TieringOffloadingManager(OffloadingManager):
                     continue
                 if not self._should_store_to_tier(tier, len(keys)):
                     continue
-                job_metadata = self.create_store_job(keys, req_context, tier_idx)
-                tier.submit_store(job_metadata)
+                claim = self._claim(keys, req_context, tier_idx, promote=False)
+                if claim.job is not None:
+                    tier.submit_store(claim.job)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -1217,33 +1315,79 @@ class TieringOffloadingManager(OffloadingManager):
         state.pending_primary_stores -= 1
         self._maybe_finalize_request(req_id)
 
-    def create_store_job(
+    def _claim(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
         tier_idx: int = 0,
-    ) -> TransferJob:
-        """Pin chunks in the primary tier and create a tracked store job.
+        *,
+        promote: bool = True,
+        track_claim: bool = False,
+    ) -> ClaimResult:
+        """Shared claim path. `tier_idx` is excluded from promotion discovery;
+        `track_claim` makes repeated serve claims idempotent."""
+        keys = list(dict.fromkeys(keys))
 
-        Calls prepare_read() to increment ref_cnt (protecting chunks
-        from eviction during the async transfer), allocates a job ID,
-        and registers the job in _jobs.
+        req_id = req_context.req_id
+        claims = self._serve_claims.setdefault(req_id, {}) if track_claim else {}
+        resident: list[OffloadKey] = []
+        pending: list[OffloadKey] = []
+        missing: list[OffloadKey] = []
+        by_tier: dict[int, list[OffloadKey]] = {}
 
-        The caller is responsible for the actual data transfer and
-        reporting completion via get_finished_jobs().
-        """
-        primary_chunks_spec = self.primary_tier.prepare_read(keys, req_context)
-        assert isinstance(primary_chunks_spec, CPULoadStoreSpec)
-        job_id = self._next_job_id()
-        job_metadata = TransferJob(
-            job_id=job_id,
-            keys=keys,
-            chunk_ids=primary_chunks_spec.chunk_ids,
-            is_promotion=False,
-            req_context=req_context,
-        )
-        self._register_job(job_metadata, tier_idx)
-        return job_metadata
+        for key in keys:
+            result, source_tier = self._locate(
+                key, req_context, tier_idx, promote=promote
+            )
+            if result is LookupResult.HIT:
+                if (key, tier_idx) in claims:
+                    pending.append(key)
+                else:
+                    resident.append(key)
+            elif result is LookupResult.HIT_PENDING:
+                if source_tier is None:
+                    pending.append(key)
+                else:
+                    by_tier.setdefault(source_tier, []).append(key)
+            else:
+                (pending if result is LookupResult.RETRY else missing).append(key)
+
+        job: TransferJob | None = None
+        if resident:
+            # A serve claim is not a local load: pin without touching the
+            # request's recency.
+            primary_chunks_spec = self.primary_tier.prepare_read(resident, req_context)
+            assert isinstance(primary_chunks_spec, CPULoadStoreSpec)
+            job = TransferJob(
+                job_id=self._next_job_id(),
+                keys=resident,
+                chunk_ids=primary_chunks_spec.chunk_ids,
+                is_promotion=False,
+                req_context=req_context,
+            )
+            self._register_job(job, tier_idx)
+            if track_claim:
+                for key in resident:
+                    claims[(key, tier_idx)] = job.job_id
+
+        rejected: list[OffloadKey] = []
+        # A claim keeps a partial allocation; keys that did not fit are rejected.
+        for source_tier, tier_keys in by_tier.items():
+            write = self.primary_tier.prepare_write(tier_keys, req_context)
+            if write is None:
+                self._metrics.on_promotion_allocation_failure()
+                rejected.extend(tier_keys)
+                continue
+            allocated = list(write.keys_to_store)
+            allocated_set = set(allocated)
+            rejected.extend(key for key in tier_keys if key not in allocated_set)
+            if allocated:
+                self._queue_promotion(source_tier, write, req_context)
+            pending.extend(allocated)
+
+        if track_claim and not claims:
+            self._serve_claims.pop(req_id, None)
+        return ClaimResult(job, pending, missing, rejected)
 
     @override
     def on_new_request(
@@ -1317,6 +1461,7 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             tier.on_request_finished(state.req_context)
         self._metrics.on_request_finished(state.req_context)
+        self._serve_claims.pop(req_id, None)
         del self._req_state[req_id]
 
     @override
@@ -1453,6 +1598,7 @@ class TieringOffloadingManager(OffloadingManager):
         for state in self._req_state.values():
             state.plan_sources.clear()
             state.commit_pins.clear()
+        self._serve_claims.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []

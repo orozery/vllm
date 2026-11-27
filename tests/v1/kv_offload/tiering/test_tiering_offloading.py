@@ -1404,6 +1404,80 @@ class TestTieringOffloadingManager:
         )
         assert state.commit_pins == set()
 
+    def test_claim_serves_residents_while_promotions_held(self, manager_setup):
+        resident, secondary = to_keys([40, 41])
+        self._start_request()
+        assert self.primary_tier.prepare_write([resident], _CTX) is not None
+        self.primary_tier.complete_write([resident], _CTX, success=True)
+        self.secondary_tier1.chunks[secondary] = True
+        self.manager._promotions_held = True
+
+        claim = self.manager._claim([resident, secondary], _CTX)
+
+        assert claim.job is not None
+        assert list(claim.job.keys) == [resident]
+        assert claim.missing_keys == [secondary]
+        resident_chunk = self.primary_tier._policy.get(resident)
+        assert resident_chunk is not None
+        assert resident_chunk.ref_cnt == 1
+
+    def test_claim_retries_promotion_without_double_allocation(
+        self, manager_setup, monkeypatch
+    ):
+        chunk = to_keys([42])[0]
+        # _claim excludes the claiming tier; use the second secondary tier.
+        self.secondary_tier2.chunks[chunk] = True
+        prepare_write = MagicMock(wraps=self.primary_tier.prepare_write)
+        monkeypatch.setattr(self.primary_tier, "prepare_write", prepare_write)
+
+        first = self.manager._claim([chunk], _CTX)
+        second = self.manager._claim([chunk], _CTX)
+
+        assert first.pending_keys == [chunk]
+        assert second.pending_keys == [chunk]
+        prepare_write.assert_called_once()
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
+    def test_claim_with_promote_false_reports_missing(self, manager_setup, monkeypatch):
+        chunk = to_keys([43])[0]
+        self.secondary_tier1.chunks[chunk] = True
+        prepare_write = MagicMock(wraps=self.primary_tier.prepare_write)
+        monkeypatch.setattr(self.primary_tier, "prepare_write", prepare_write)
+
+        claim = self.manager._claim([chunk], _CTX, promote=False)
+
+        assert claim.job is None
+        assert claim.missing_keys == [chunk]
+        prepare_write.assert_not_called()
+
+    def test_claim_promotes_a_key_after_its_promotion_failed(
+        self, manager_setup, monkeypatch
+    ):
+        """A failed promotion frees the primary chunk but not the copy; a later
+        claim is what starts the retry."""
+        from vllm.v1.kv_offload.tiering.base import JobResult
+
+        chunk = to_keys([44])[0]
+        # _claim excludes the claiming tier; use the second secondary tier.
+        self.secondary_tier2.chunks[chunk] = True
+        self._start_request()
+
+        def submit_failing(job_metadata):
+            self.secondary_tier2.completed_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+
+        monkeypatch.setattr(self.secondary_tier2, "submit_load", submit_failing)
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.MISS
+
+        claim = self.manager._claim([chunk], _CTX)
+
+        assert claim.pending_keys == [chunk]
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
     def test_complete_store_forwards_req_context_to_submit_store(
         self, manager_setup, monkeypatch
     ):

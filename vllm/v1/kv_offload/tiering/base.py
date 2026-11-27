@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 
-# Type alias for job IDs used in async transfer tracking
+# Type alias for job IDs used in async transfer tracking.
 JobId = int
 
 TIER_LABEL = "tier"
@@ -92,6 +92,31 @@ class TransferJob:
     submit_time: float = field(default_factory=time.monotonic)
 
 
+class ClaimResult(NamedTuple):
+    """Outcome of `ParentManager.claim_hits()` over a set of keys.
+
+    A claim pins the chunks it can serve and reports the rest, so a caller
+    never has to retry a rejected key on its own.
+
+    Attributes:
+        job: The transfer job covering the keys pinned by this claim, or None if
+            no key could be pinned.
+        pending_keys: Keys that are present but not yet readable, or whose
+            asynchronous lookup has not converged. The caller keeps waiting
+            for these and claims them once readable.
+        missing_keys: Keys that are absent, or that would need a promotion the
+            claim is not allowed to start.
+        rejected_keys: Keys that are present but could not be promoted now,
+            e.g. because the primary tier had no room.
+
+    """
+
+    job: TransferJob | None
+    pending_keys: list[OffloadKey]
+    missing_keys: list[OffloadKey]
+    rejected_keys: list[OffloadKey]
+
+
 @dataclass(slots=True)
 class JobResult:
     """Result of an async transfer job."""
@@ -125,13 +150,14 @@ class ParentManager(ABC):
         1. on_new_request(req_context)  — set up per-request state
         2. lookup(key, req_context)     — check chunk availability
            (repeat per chunk)
-        3. create_store_job(keys, req_context) — pin chunks and get a
-           job handle
+        3. claim_hits(keys, req_context) — claim chunks and get a job;
+           idempotent per (req_context, key) until the job completes
         4. on_request_finished(req_context) — clean up per-request state
 
     Steps 2-3 may be interleaved. Step 4 must be called even if no
     chunks were found, to avoid leaking async lookup state (e.g. in
-    the fs tier's AsyncLookupManager).
+    the fs tier's AsyncLookupManager). A caller that wants a secondary
+    copy promoted claims it through `claim_hits()`.
     """
 
     @abstractmethod
@@ -141,11 +167,29 @@ class ParentManager(ABC):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult: ...
 
     @abstractmethod
-    def create_store_job(
+    def claim_hits(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> TransferJob: ...
+        *,
+        promote: bool = True,
+    ) -> ClaimResult:
+        """Claim chunks in the primary tier for a peer transfer.
+
+        `HIT` keys are pinned and included in the job. `HIT_PENDING` keys are
+        reported pending. With `promote`, a key held only by a secondary tier
+        gets a promotion slot and is reported pending; without it, such a key
+        is missing. A `RETRY` key is reported pending for a later claim.
+
+        Claims are idempotent per `(req_context, key)` until the job completes.
+
+        Args:
+            keys: Chunks to claim.
+            req_context: Per-request context.
+            promote: Whether a secondary-only key may be promoted.
+
+        """
+        ...
 
     @abstractmethod
     def on_request_finished(self, req_context: ReqContext) -> None: ...
@@ -246,8 +290,9 @@ class SecondaryTierManager(ABC):
 
         Returns:
             HIT if the chunk is present and ready,
+            HIT_PENDING if it is present but not yet readable,
             MISS if not found,
-            or RETRY if the chunk is being transferred (retry later).
+            or RETRY if the lookup has not converged (retry later).
 
         """
         pass
