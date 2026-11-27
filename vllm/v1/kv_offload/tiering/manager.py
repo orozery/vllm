@@ -908,7 +908,7 @@ class TieringOffloadingManager(OffloadingManager):
         by_tier: dict[int, list[OffloadKey]] = {}
         for key in new_keys:
             result, source_tier = self._locate(key, req_context)
-            if source_tier is not None and key in state.failed_writes:
+            if key in state.failed_writes:
                 # Promoting this key already failed for this request; do not
                 # loop. A copy that became resident is still committable.
                 self._release_plan(req_id)
