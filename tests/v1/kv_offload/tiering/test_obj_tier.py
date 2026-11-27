@@ -643,7 +643,8 @@ class TestMockObjTierFailures:
         primary_tier.complete_store(
             keys, _CTX, trigger=StoreTrigger.ON_COMPUTE, success=True
         )
-        job = manager.create_store_job(keys, _CTX)
+        job = manager._claim(keys, _CTX).job
+        assert job is not None
         obj_tier.submit_store(job)
 
         block = primary_tier._policy.get(keys[0])

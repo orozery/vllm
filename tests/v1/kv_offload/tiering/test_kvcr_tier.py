@@ -39,7 +39,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.tiering.backpressure import EMABackpressureDetector
-from vllm.v1.kv_offload.tiering.base import JobResult, TransferJob
+from vllm.v1.kv_offload.tiering.base import ClaimResult, JobResult, TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.kvcr import manager as kvcr_manager
 from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
@@ -505,13 +505,24 @@ def test_kvcr_tier_serves_primary_pin_request(
         def lookup(self, key, req_context):
             return LookupResult.HIT if key in hit_keys else LookupResult.MISS
 
-        def create_store_job(self, requested_keys, req_context):
-            return TransferJob(
-                job_id=11,
-                keys=requested_keys if job_keys is None else job_keys,
-                chunk_ids=np.array(chunk_ids, dtype=np.int32),
-                is_promotion=True,
-                req_context=req_context,
+        def claim_hits(self, requested_keys, req_context, *, promote=True):
+            assert promote is False
+            claimed = (
+                tuple(key for key in requested_keys if key in hit_keys)
+                if job_keys is None
+                else job_keys
+            )
+            return ClaimResult(
+                TransferJob(
+                    job_id=11,
+                    keys=claimed,
+                    chunk_ids=np.array(chunk_ids, dtype=np.int32),
+                    is_promotion=False,
+                    req_context=req_context,
+                ),
+                pending_keys=[],
+                missing_keys=[],
+                rejected_keys=[],
             )
 
         def on_request_finished(self, req_context):

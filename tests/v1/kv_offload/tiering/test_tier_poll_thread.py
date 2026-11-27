@@ -373,7 +373,12 @@ class _PromotingTier(_FakeTier):
         self.promoted = threading.Event()
 
     def _promote(self, parent: ParentManager) -> None:
-        parent.lookup(OffloadKey(b"\x07" * 8), ReqContext(req_id="peer"))
+        key = OffloadKey(b"\x07" * 8)
+        ctx = ReqContext(req_id="peer")
+        assert parent.lookup(key, ctx) is LookupResult.HIT_PENDING
+        # Discovery no longer promotes; the claim starts the promotion.
+        claim = parent.claim_hits([key], ctx)
+        assert claim.pending_keys == [key]
         self.promoted.set()
 
 
