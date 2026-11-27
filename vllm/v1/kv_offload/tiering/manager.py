@@ -838,7 +838,7 @@ class TieringOffloadingManager(OffloadingManager):
             del state.plan_sources[key]
 
         # A recorded key can be evicted while the plan waits; check every key.
-        for key in keys:
+        for key in [k for k in keys if k not in state.plan_sources]:
             if self.primary_tier.lookup(key, req_context) is LookupResult.MISS:
                 self._release_plan(req_id)
                 return None
