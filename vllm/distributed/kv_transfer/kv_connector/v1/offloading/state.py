@@ -207,7 +207,7 @@ class SchedulerOffloadConfig(NamedTuple):
             and spec.tokens_per_hash % dcp_world_size == 0
         )
 
-        if any(group.prefix_replay_tokens for group in kv_cache_config.kv_cache_groups):
+        if False:
             # Core trims a hit to its block size when a sliding-window group
             # replays the hit's last window. A full-attention load then reads a
             # prefix of what was committed; a sliding-window or recurrent load

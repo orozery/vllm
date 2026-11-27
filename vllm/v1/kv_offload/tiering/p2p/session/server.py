@@ -572,9 +572,6 @@ class ServerRole:
                 lookup.resolved[h] = False
                 lookup.pending.discard(h)
             # A HIT evicted before the claim could pin it is pending again.
-            for h in claim.pending_keys:
-                if lookup.resolved.pop(h, False):
-                    lookup.pending.add(h)
         return new_hits
 
     def _process_inbound_lookup(

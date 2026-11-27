@@ -908,7 +908,7 @@ class TieringOffloadingManager(OffloadingManager):
         by_tier: dict[int, list[OffloadKey]] = {}
         for key in new_keys:
             result, source_tier = self._locate(key, req_context)
-            if source_tier is not None and key in state.failed_writes:
+            if key in state.failed_writes:
                 # Promoting this key already failed for this request; do not
                 # loop. A copy that became resident is still committable.
                 self._release_plan(req_id)
@@ -1118,6 +1118,7 @@ class TieringOffloadingManager(OffloadingManager):
         # withdraws them all; an already-submitted one completes on its own.
         self._cancel_promotions(req_id, list(state.plan_sources))
         state.plan_sources.clear()
+        state.failed_writes.clear()
 
     def _forget_claims(
         self,
@@ -1539,8 +1540,6 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.on_request_finished(req_context)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
-        # A plan that never reached prepare_load gives its pins back now.
-        self._release_plan(req_context.req_id)
         self._maybe_finalize_request(req_context.req_id, exclude_tier_idx)
 
     def _maybe_finalize_request(

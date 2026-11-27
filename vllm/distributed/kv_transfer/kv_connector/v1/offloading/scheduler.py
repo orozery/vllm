@@ -1119,11 +1119,6 @@ class OffloadingConnectorScheduler:
                         num_hit_tokens = 0
                     else:
                         req_status.load_sources = dict(sources)
-                if num_hit_tokens == 0:
-                    # A committed key is gone; plan again from what is left.
-                    num_hit_tokens = self._lookup_and_commit(
-                        req_status, max_num_new_tokens, plan_inputs
-                    )
             else:
                 # An input moved -- the local prefix grew, the request was
                 # preempted and re-admitted, or a token cap changed -- so the
