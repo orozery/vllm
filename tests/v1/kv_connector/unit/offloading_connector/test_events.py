@@ -780,11 +780,13 @@ def test_pending_promotion_captures_payload_before_inventory(history, success):
     primary.prepare_store([key], ctx, trigger=StoreTrigger.ON_COMPUTE)
 
     scheduler = SimpleNamespace(manager=primary, _events_tracker=tracker)
+    # A present-but-unreadable chunk now counts as a hit; the commit/readiness
+    # layer is what defers the request.
     assert (
         OffloadingConnectorScheduler._maximal_prefix_lookup(
             scheduler, [key], ctx, req, group, 0
         )
-        is None
+        == 1
     )
     assert primary.lookup(key, ctx) is LookupResult.HIT_PENDING
     assert list(tracker.take_events(primary.take_events())) == []
@@ -841,7 +843,7 @@ def test_failed_pending_chunk_does_not_remove_shared_ready_prefix():
         OffloadingConnectorScheduler._maximal_prefix_lookup(
             scheduler, [failed_key], ctx, failed_req, group, 0
         )
-        is None
+        == 1
     )
     primary.complete_store(
         [failed_key], ctx, trigger=StoreTrigger.ON_COMPUTE, success=False
@@ -868,7 +870,7 @@ def test_failed_pending_retry_preserves_replacement_metadata(success):
             OffloadingConnectorScheduler._maximal_prefix_lookup(
                 scheduler, [key], ctx, req, group, 0
             )
-            is None
+            == 1
         )
         if attempt == 0:
             primary.complete_store(
